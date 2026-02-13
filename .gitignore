@@ -1,0 +1,68 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Env files
+.env
+.env.*
+*.env
+
+# Firebase Admin / Service Accounts
+service-account.json
+firebase-admin.json
+google-services.json
+GoogleService-Info.plist
+
+# Private keys
+*.pem
+*.key
+private_key.json
+secrets/
+
+# Cloudflare Worker local config
+wrangler.toml
+.dev.vars
+
+# VSCode local
+.vscode/
+
+# mac
+.DS_Store
