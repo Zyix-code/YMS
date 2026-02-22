@@ -58,7 +58,7 @@ Her kullanıcı için:
 - `dailyMessages`
 - `winnerStreak`
 - `totalWins`
-- `dailyKey`
+- `lastResultDayKey`
 
 alanları tutulur.
 
