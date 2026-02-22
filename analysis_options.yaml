@@ -1,0 +1,9 @@
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    avoid_print: true
+    unnecessary_lambdas: true
+    prefer_const_constructors: true
+    prefer_final_locals: true
+    curly_braces_in_flow_control_structures: false
