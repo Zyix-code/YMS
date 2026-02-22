@@ -51,6 +51,7 @@ Kişisel ve duygusal bir motivasyonla geliştirilmiştir ❤️
 - `pairedUserId` üzerinden çift oluşturulur
 
 ### 2️⃣ Günlük Sayaç
+
 Her kullanıcı için:
 
 - `dailyHearts`
@@ -59,7 +60,9 @@ Her kullanıcı için:
 - `totalWins`
 - `dailyKey`
 
-tutulur.
+alanları tutulur.
+
+---
 
 ### 3️⃣ Gün Sonu Değerlendirme
 
@@ -71,128 +74,182 @@ Saat 00:00 sonrası ilk girişte:
 - Seri güncellenir
 - Günlük sayaçlar sıfırlanır
 
-### 4️⃣ Push Bildirim Altyapısı
+---
 
-Sistem 2 katmandan oluşur:
+## 🔐 Firestore Security Rules
 
-- Firebase Cloud Messaging
-- Cloudflare Worker (serverless push proxy)
+Aşağıdaki kurallar **çift mantığına özel yazılmıştır** ve sadece eşleşmiş kullanıcıların birbirine erişmesine izin verir.
 
-Worker, FCM HTTP v1 API kullanarak güvenli push gönderir.
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function hasMyUserDoc() {
+      return exists(/databases/$(database)/documents/users/$(uid()));
+    }
+
+    function myUserDoc() {
+      return get(/databases/$(database)/documents/users/$(uid())).data;
+    }
+
+    function myPartnerUid() {
+      return hasMyUserDoc() ? myUserDoc().pairedUserId : null;
+    }
+
+    function pairIdAB(a, b) { return a + "_" + b; }
+
+    function isMyPairId(pid) {
+      return signedIn()
+        && hasMyUserDoc()
+        && (myPartnerUid() is string)
+        && (
+          pid == pairIdAB(uid(), myPartnerUid()) ||
+          pid == pairIdAB(myPartnerUid(), uid())
+        );
+    }
+
+    match /users/{userId} {
+      allow create: if signedIn() && uid() == userId;
+      allow read: if signedIn() && uid() == userId;
+      allow update: if signedIn() && uid() == userId;
+      allow delete: if false;
+    }
+
+    match /interactions/{id} {
+      allow create: if signedIn();
+      allow read: if signedIn();
+      allow update, delete: if false;
+    }
+  }
+}
+```
+
+> Not: Production ortamında daha sıkı validasyon önerilir.
+
+---
+
+## ☁️ Cloudflare Worker (Push Proxy)
+
+Push bildirimleri doğrudan istemciden gönderilmez.  
+Güvenlik için **Cloudflare Worker üzerinden FCM HTTP v1 API kullanılır.**
+
+---
+
+### 🔑 Worker Secrets (Cloudflare Dashboard > Settings > Variables)
+
+Aşağıdaki secret'ları eklemelisiniz:
+
+```
+API_KEY=buraya_kendi_api_keyiniz
+FIREBASE_PROJECT_ID=buraya_firebase_project_id
+GSA_CLIENT_EMAIL=buraya_service_account_email
+GSA_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+BURAYA_KENDI_PRIVATE_KEYINIZ
+-----END PRIVATE KEY-----"
+```
+
+---
+
+## 📄 worker.js
+
+```javascript
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/push") {
+      return handlePush(request, env);
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};
+
+async function handlePush(request, env) {
+
+  const apiKey = request.headers.get("X-API-Key");
+  if (apiKey !== env.API_KEY) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const body = await request.json();
+  const { token, title, message } = body;
+
+  if (!token) {
+    return new Response("Token missing", { status: 400 });
+  }
+
+  const accessToken = await getAccessToken(env);
+
+  const response = await fetch(
+    `https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/messages:send`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: {
+          token: token,
+          notification: {
+            title: title || "YMS 💗",
+            body: message || "Seni düşündü ❤️",
+          },
+        },
+      }),
+    }
+  );
+
+  const text = await response.text();
+  return new Response(text, { status: response.status });
+}
+
+async function getAccessToken(env) {
+  // JWT üretim ve Google OAuth token alma işlemi burada yapılır
+  // (Production için RS256 imzalama kodu eklenmelidir)
+  throw new Error("Access token implementation required.");
+}
+```
 
 ---
 
 ## 🛠️ Teknolojiler
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Flutter-02569B?logo=flutter&logoColor=white&style=flat-square">
-  <img src="https://img.shields.io/badge/Firebase-Firestore-FFCA28?logo=firebase&logoColor=black&style=flat-square">
-  <img src="https://img.shields.io/badge/FCM-Push-FF6F00?logo=firebase&logoColor=white&style=flat-square">
-  <img src="https://img.shields.io/badge/Cloudflare-Worker-F38020?logo=cloudflare&logoColor=white&style=flat-square">
-</p>
-
----
-
-## 📂 Proje Yapısı
-
-```
-lib/
- ├── screens/
- ├── services/
- ├── utils/
- ├── theme/
- └── main.dart
-
-web/
-firebase-messaging-sw.js
-worker.js
-```
-
----
-
-## 🔐 Güvenlik
-
-Bu repo içinde:
-
-- ❌ Firebase private key bulunmaz
-- ❌ Service account dosyası bulunmaz
-- ❌ Cloudflare API key bulunmaz
-- ❌ Environment secret dosyaları bulunmaz
-
-Tüm hassas veriler:
-
-- Cloudflare Worker Secrets
-- Firebase Console
-- Environment Variables
-
-üzerinden yönetilir.
+- Flutter
+- Firebase Authentication
+- Firestore
+- Firebase Cloud Messaging (FCM)
+- Cloudflare Workers
 
 ---
 
 ## ⚙️ Kurulum
 
-### 1️⃣ Firebase Kurulumu
+### 1️⃣ Firebase
 
-- Firebase project oluştur
-- Firestore aktif et
 - Authentication aktif et
+- Firestore aktif et
 - Cloud Messaging aktif et
 
-### 2️⃣ Cloudflare Worker
+### 2️⃣ Worker Deploy
 
-Worker içerisine:
-
-- API_KEY
-- GSA_CLIENT_EMAIL
-- GSA_PRIVATE_KEY
-- FIREBASE_PROJECT_ID
-
-secret olarak eklenmelidir.
-
-### 3️⃣ Flutter
-
+```bash
+npm install -g wrangler
+wrangler login
+wrangler deploy
 ```
-flutter pub get
-flutter run -d chrome
-```
-
----
-
-## 🏆 Günlük Kazanma Mantığı
-
-Kazanan =  
-`dailyHearts + dailyMessages` toplamı yüksek olan kişi.
-
-Eşitlik durumunda kazanan yoktur.
-
-Toplam kazanma:
-```
-totalWins
-```
-
-Seri:
-```
-winnerStreak
-```
-
----
-
-## 💡 Gelecek Planları
-
-- 🎨 Tema seçimi
-- 📈 Haftalık istatistik ekranı
-- 📅 Özel gün hatırlatıcı
-- 💬 Sesli mesaj
-- 📷 Fotoğraf gönderme
-- 🏅 Rozet sistemi
 
 ---
 
 ## ⚖️ Lisans
 
-Bu proje kişisel kullanım için geliştirilmiştir.
-
-Açık kaynak olarak paylaşılmıştır ancak ticari kullanım için uygun değildir.
+Bu proje kişisel kullanım içindir.  
+Ticari kullanım için uygun değildir.
 
 ---
 
@@ -202,4 +259,5 @@ Bu uygulama, koddan çok hisle yazılmıştır.
 
 Birine değer verdiğinizde,  
 bunu göstermek için bazen küçük bir yazılım yeterlidir.
+
 Made with ❤️ by Selçuk
