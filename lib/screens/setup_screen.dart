@@ -4,6 +4,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import '../services/firestore_service.dart';
 import '../services/pairing_service.dart';
+import '../theme/app_theme.dart';
+import '../theme/theme_controller.dart';
 import '../utils/app_error.dart';
 import 'pairing_screen.dart';
 
@@ -56,7 +58,7 @@ class _SetupScreenState extends State<SetupScreen> {
       required IconData icon,
       required String label,
       required Color color}) {
-    bool isSel = _gender == id;
+    final bool isSel = _gender == id;
     return Expanded(
       child: GestureDetector(
         onTap: () => setState(() => _gender = id),
@@ -67,16 +69,91 @@ class _SetupScreenState extends State<SetupScreen> {
             color: isSel ? color.withOpacity(0.1) : Colors.transparent,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
-                color: isSel ? color : Colors.grey.shade300, width: 2),
+                color: isSel
+                    ? color
+                    : Theme.of(context).brightness == Brightness.dark
+                        ? Colors.white.withAlpha(18)
+                        : Colors.grey.shade300,
+                width: 2),
           ),
           child: Column(
             children: [
-              Icon(icon, color: isSel ? color : Colors.grey, size: 28),
+              Icon(
+                icon,
+                color: isSel
+                    ? color
+                    : Theme.of(context).colorScheme.onSurface.withAlpha(150),
+                size: 28,
+              ),
               const SizedBox(height: 4),
               Text(label,
                   style: TextStyle(
-                      color: isSel ? color : Colors.grey,
+                      color: isSel
+                          ? color
+                          : Theme.of(context)
+                              .colorScheme
+                              .onSurface
+                              .withAlpha(170),
                       fontWeight: isSel ? FontWeight.bold : FontWeight.normal)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _themeBtn({
+    required bool isDark,
+    required IconData icon,
+    required String label,
+  }) {
+    final selected = ThemeController.instance.isDark == isDark;
+
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () async {
+          await ThemeController.instance.setMode(
+            isDark ? AppThemeMode.dark : AppThemeMode.light,
+          );
+          if (mounted) setState(() {});
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: selected
+                ? AppTheme.primary.withOpacity(0.12)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: selected
+                  ? AppTheme.primary
+                  : Theme.of(context).brightness == Brightness.dark
+                      ? Colors.white.withAlpha(18)
+                      : Colors.grey.shade300,
+              width: 2,
+            ),
+          ),
+          child: Column(
+            children: [
+              Icon(
+                icon,
+                color: selected
+                    ? AppTheme.primary
+                    : Theme.of(context).colorScheme.onSurface.withAlpha(170),
+                size: 28,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  color: selected
+                      ? AppTheme.primary
+                      : Theme.of(context).colorScheme.onSurface.withAlpha(185),
+                  fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+                ),
+              ),
             ],
           ),
         ),
@@ -187,7 +264,10 @@ class _SetupScreenState extends State<SetupScreen> {
                     Text(
                       'Partnerin seni nasıl göreceğini belirle.',
                       style: TextStyle(
-                          color: Colors.black.withAlpha(150),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .onSurface
+                              .withAlpha(170),
                           fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 20),
@@ -207,6 +287,28 @@ class _SetupScreenState extends State<SetupScreen> {
                             icon: Icons.female,
                             label: "Kadın",
                             color: Colors.pink),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    const SizedBox(height: 20),
+                    const Text(
+                      "Tema Seçimi",
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        _themeBtn(
+                          isDark: false,
+                          icon: Icons.light_mode_rounded,
+                          label: "Açık",
+                        ),
+                        const SizedBox(width: 12),
+                        _themeBtn(
+                          isDark: true,
+                          icon: Icons.dark_mode_rounded,
+                          label: "Koyu",
+                        ),
                       ],
                     ),
                     const SizedBox(height: 20),

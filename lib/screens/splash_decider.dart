@@ -62,8 +62,9 @@ class _SplashDeciderState extends State<SplashDecider> {
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
-      body: Center(child: CircularProgressIndicator()),
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: const Center(child: CircularProgressIndicator()),
     );
   }
 }

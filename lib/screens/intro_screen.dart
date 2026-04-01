@@ -37,7 +37,7 @@ class _IntroScreenState extends State<IntroScreen>
       ));
     }
 
-    Future.delayed(const Duration(milliseconds: 8000), () {
+    Future.delayed(const Duration(milliseconds: 2800), () {
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
@@ -70,13 +70,19 @@ class _IntroScreenState extends State<IntroScreen>
           return Stack(
             children: [
               Container(
-                decoration: const BoxDecoration(
+                decoration: BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [
-                      Color(0xFFEDEFF6),
-                      Color(0xFFDDE3F0),
-                      Color(0xFFC9D2E8),
-                    ],
+                    colors: Theme.of(context).brightness == Brightness.dark
+                        ? const [
+                            Color(0xFF15151C),
+                            Color(0xFF1E1E29),
+                            Color(0xFF2A2030),
+                          ]
+                        : const [
+                            Color(0xFFEDEFF6),
+                            Color(0xFFDDE3F0),
+                            Color(0xFFC9D2E8),
+                          ],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
@@ -107,31 +113,34 @@ class _IntroScreenState extends State<IntroScreen>
                       child: Container(
                         padding: const EdgeInsets.all(28),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.6),
+                          color: Theme.of(context).brightness == Brightness.dark
+                              ? Colors.white.withOpacity(0.08)
+                              : Colors.white.withOpacity(0.6),
                           borderRadius: BorderRadius.circular(28),
                           border: Border.all(
-                            color: Colors.white.withOpacity(0.4),
+                            color: Theme.of(context).dividerColor.withAlpha(80),
                           ),
                         ),
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Icon(
+                            const Icon(
                               Icons.favorite_rounded,
                               size: 60,
                               color: AppTheme.primary,
                             ),
                             const SizedBox(height: 18),
-                            const Text(
+                            Text(
                               'YMS',
                               style: TextStyle(
                                 fontSize: 36,
                                 fontWeight: FontWeight.w900,
                                 letterSpacing: 3,
+                                color: Theme.of(context).colorScheme.onSurface,
                               ),
                             ),
                             const SizedBox(height: 20),
-                            const Text(
+                            Text(
                               'Bu uygulamanın asıl amacı kız arkadaşım için yapılmış olup,\n'
                               'gün içinde birbirimize küçük hatırlatmalar göndermemizi sağlamaktır.',
                               textAlign: TextAlign.center,
@@ -139,12 +148,16 @@ class _IntroScreenState extends State<IntroScreen>
                                 fontSize: 15.5,
                                 fontStyle: FontStyle.italic,
                                 height: 1.6,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurface
+                                    .withAlpha(210),
                               ),
                             ),
                             const SizedBox(height: 30),
                             const Divider(),
                             const SizedBox(height: 12),
-                            const Text(
+                            Text(
                               'Bu program SELÇUK ŞAHİN tarafından geliştirilmiştir.\n'
                               'Herhangi bir arıza, öneri, şikayet için\n'
                               'selcuksahin158@gmail.com adresine mail gönderebilirsiniz.',
@@ -153,6 +166,10 @@ class _IntroScreenState extends State<IntroScreen>
                                 fontSize: 13.5,
                                 fontWeight: FontWeight.w500,
                                 height: 1.6,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurface
+                                    .withAlpha(190),
                               ),
                             ),
                             const SizedBox(height: 18),
@@ -168,9 +185,10 @@ class _IntroScreenState extends State<IntroScreen>
                                       'https://instagram.com/selcukshn74'),
                                 ),
                                 IconButton(
-                                  icon: const FaIcon(
+                                  icon: FaIcon(
                                     FontAwesomeIcons.github,
-                                    color: Colors.black,
+                                    color:
+                                        Theme.of(context).colorScheme.onSurface,
                                   ),
                                   onPressed: () =>
                                       _launch('https://github.com/Zyix-code'),

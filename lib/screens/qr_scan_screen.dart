@@ -83,7 +83,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
               'İpucu: Aynı anda iki YMS sekmesi açıksa kamera “kullanımda” hatası verebilir.',
               textAlign: TextAlign.center,
               style: TextStyle(
-                color: Colors.black.withAlpha(140),
+                color: Theme.of(context).colorScheme.onSurface.withAlpha(160),
                 fontWeight: FontWeight.w700,
                 fontSize: 12,
               ),
@@ -112,7 +112,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
             child: Text(
               'QR kodu kameraya göster.',
               style: TextStyle(
-                color: Colors.black.withAlpha(160),
+                color: Theme.of(context).colorScheme.onSurface.withAlpha(180),
                 fontWeight: FontWeight.w700,
               ),
             ),

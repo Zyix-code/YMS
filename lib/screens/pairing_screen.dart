@@ -391,7 +391,7 @@ class _PairingScreenState extends State<PairingScreen> {
                 'Not: Kod yenilersen eski kod pasif olur.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  color: Colors.black.withAlpha(140),
+                  color: Theme.of(context).colorScheme.onSurface.withAlpha(160),
                   fontWeight: FontWeight.w800,
                 ),
               ),

@@ -1,3 +1,5 @@
+// ignore_for_file: use_build_context_synchronously
+
 import 'dart:async';
 import 'dart:math';
 
@@ -7,14 +9,33 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'journey_screen.dart';
+import 'pairing_screen.dart';
+
 import '../services/firestore_service.dart';
 import '../services/love_messages.dart';
 import '../services/notification_service.dart';
 import '../services/pairing_service.dart';
 import '../services/push_service.dart';
+
 import '../theme/app_theme.dart';
+import '../theme/theme_controller.dart';
+
 import '../utils/app_error.dart';
-import 'pairing_screen.dart';
+
+import '../widgets/home/chat_history_widget.dart';
+import '../widgets/home/home_header_card.dart';
+import '../widgets/home/last_message_widget.dart';
+import '../widgets/home/mood_card.dart';
+
+enum LocationUpdateResult {
+  updated,
+  unchanged,
+  serviceDisabled,
+  permissionDenied,
+  timeout,
+  error,
+}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -23,34 +44,86 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
-  String? _uid;
+class _HomeScreenState extends State<HomeScreen> {
+  int _currentIndex = 0;
 
+  final List<Widget> _pages = const [
+    _HomeBody(),
+    JourneyScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _currentIndex,
+        children: _pages,
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        onTap: (index) => setState(() => _currentIndex = index),
+        selectedLabelStyle: const TextStyle(
+          fontWeight: FontWeight.bold,
+          fontSize: 12,
+        ),
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.favorite),
+            label: 'Aşk Paneli',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.auto_awesome_motion),
+            label: 'Yolculuk',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _HomeBody extends StatefulWidget {
+  const _HomeBody();
+
+  @override
+  State<_HomeBody> createState() => _HomeBodyState();
+}
+
+class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
+  String? _uid;
   bool _showHistory = false;
   bool _sending = false;
   bool _unpairing = false;
-  String? _error;
-
   bool _notifEnabled = false;
+  bool _didNavigateToPairing = false;
+  bool _heartTapLocked = false;
+  bool _messageTapLocked = false;
+  String? _error;
 
   DateTime? _lastSendAt;
   static const int cooldownSeconds = 300;
+  static const String _kLastSendAtMs = 'yms_last_send_at_ms';
+  static const String _kLastLocationLat = 'yms_last_location_lat';
+  static const String _kLastLocationLng = 'yms_last_location_lng';
+  static const double _minDistanceMeters = 200;
 
   Timer? _cooldownTicker;
   int _lastSnackAtMs = 0;
+  StreamSubscription<Position>? _positionSub;
+  bool _locationStreamStarted = false;
 
-  final _manual = TextEditingController();
-  final _rand = Random();
+  bool _hasSyncedInitialLocation = false;
+  bool _isAutoLocationWriting = false;
+
+  final TextEditingController _manual = TextEditingController();
+  final Random _rand = Random();
   final List<_FlyingHeart> _hearts = [];
-
-  static const String _kLastSendAtMs = 'yms_last_send_at_ms';
+  final ValueNotifier<int> _cooldownNotifier = ValueNotifier<int>(0);
 
   String? _lastSeenDayKey;
   bool _rolloverRunning = false;
   bool _didInitialAutoRollover = false;
 
   Stream<DocumentSnapshot<Map<String, dynamic>>>? _me$;
-
   String? _partnerUidCached;
   Stream<DocumentSnapshot<Map<String, dynamic>>>? _partner$;
 
@@ -59,12 +132,119 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   Stream<QuerySnapshot<Map<String, dynamic>>>? _incomingLastAll$;
 
   Future<void>? _rolloverGate;
+  Position? _lastPosition;
+
+  @override
+  void initState() {
+    super.initState();
+    _lastSeenDayKey = _todayKeyGlobalUtc();
+    _init();
+    _startCooldownTicker();
+    _refreshNotifState();
+    _loadLastSendAt();
+  }
+
+  @override
+  void dispose() {
+    _cooldownTicker?.cancel();
+    _positionSub?.cancel();
+    _cooldownNotifier.dispose();
+    _manual.dispose();
+    for (final h in _hearts) {
+      h.controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    final id = FirebaseAuth.instance.currentUser?.uid;
+    if (!mounted) return;
+
+    setState(() {
+      _uid = id;
+      _me$ = id != null
+          ? FirestoreService.instance.users.doc(id).snapshots()
+          : null;
+    });
+
+    if (id == null) return;
+
+    Future<void>(() async {
+      await _updateLocationOnce(
+        silent: true,
+        forceRemoteWrite: true,
+      );
+      await _startAutoLocationUpdates();
+    });
+  }
+
+  Future<void> _startAutoLocationUpdates() async {
+    if (_locationStreamStarted) return;
+
+    final enabled = await Geolocator.isLocationServiceEnabled();
+    if (!enabled) return;
+
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+
+    if (perm == LocationPermission.denied ||
+        perm == LocationPermission.deniedForever) {
+      return;
+    }
+
+    _locationStreamStarted = true;
+
+    await _positionSub?.cancel();
+
+    _positionSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 50,
+      ),
+    ).listen((pos) async {
+      final uid = _uid;
+      if (uid == null || _isAutoLocationWriting) return;
+
+      _isAutoLocationWriting = true;
+
+      try {
+        Position? basePosition = _lastPosition;
+        basePosition ??= await _loadLastSavedPosition();
+
+        if (!_hasSyncedInitialLocation) {
+          _lastPosition = pos;
+          await _saveLastPosition(pos);
+          await _writeLocationToFirestore(uid: uid, pos: pos);
+          _hasSyncedInitialLocation = true;
+          return;
+        }
+
+        if (basePosition != null) {
+          final distance = Geolocator.distanceBetween(
+            basePosition.latitude,
+            basePosition.longitude,
+            pos.latitude,
+            pos.longitude,
+          );
+
+          if (distance < _minDistanceMeters) return;
+        }
+
+        _lastPosition = pos;
+        await _saveLastPosition(pos);
+        await _writeLocationToFirestore(uid: uid, pos: pos);
+      } catch (_) {
+      } finally {
+        _isAutoLocationWriting = false;
+      }
+    });
+  }
 
   String _todayKeyGlobalUtc() {
-    final u = DateTime.now().toUtc();
-    return '${u.year.toString().padLeft(4, '0')}-'
-        '${u.month.toString().padLeft(2, '0')}-'
-        '${u.day.toString().padLeft(2, '0')}';
+    final trTime = DateTime.now().toUtc().add(const Duration(hours: 3));
+    return '${trTime.year}-${trTime.month.toString().padLeft(2, '0')}-${trTime.day.toString().padLeft(2, '0')}';
   }
 
   String _pairId(String a, String b) {
@@ -85,45 +265,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     if (v is bool) return v;
     if (v is num) return v != 0;
     final s = (v ?? '').toString().trim().toLowerCase();
-    return (s == 'true' || s == '1' || s == 'yes');
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _lastSeenDayKey = _todayKeyGlobalUtc();
-    _init();
-    _startCooldownTicker();
-    _refreshNotifState();
-    _loadLastSendAt();
-  }
-
-  @override
-  void dispose() {
-    _cooldownTicker?.cancel();
-    _manual.dispose();
-    for (final h in _hearts) {
-      h.controller.dispose();
-    }
-    super.dispose();
-  }
-
-  Future<void> _init() async {
-    final id = FirebaseAuth.instance.currentUser?.uid;
-    if (!mounted) return;
-
-    setState(() {
-      _uid = id;
-      _me$ = (id != null)
-          ? FirestoreService.instance.users.doc(id).snapshots()
-          : null;
-    });
-
-    if (id == null) return;
-
-    Future(() async {
-      await _updateLocationOnce(silent: true);
-    });
+    return s == 'true' || s == '1' || s == 'yes';
   }
 
   Future<void> _loadLastSendAt() async {
@@ -139,6 +281,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       }
 
       _lastSendAt = dt;
+      _cooldownNotifier.value = _cooldownLeft();
       if (mounted) setState(() {});
     } catch (_) {}
   }
@@ -157,20 +300,66 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     } catch (_) {}
   }
 
+  Future<Position?> _loadLastSavedPosition() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      final lat = sp.getDouble(_kLastLocationLat);
+      final lng = sp.getDouble(_kLastLocationLng);
+      if (lat == null || lng == null) return null;
+      return Position(
+        latitude: lat,
+        longitude: lng,
+        timestamp: DateTime.now(),
+        accuracy: 0,
+        altitude: 0,
+        altitudeAccuracy: 0,
+        heading: 0,
+        headingAccuracy: 0,
+        speed: 0,
+        speedAccuracy: 0,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _saveLastPosition(Position pos) async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setDouble(_kLastLocationLat, pos.latitude);
+      await sp.setDouble(_kLastLocationLng, pos.longitude);
+    } catch (_) {}
+  }
+
+  Future<void> _writeLocationToFirestore({
+    required String uid,
+    required Position pos,
+  }) async {
+    await FirestoreService.instance.users.doc(uid).set({
+      'lastLocation': {
+        'lat': pos.latitude,
+        'lng': pos.longitude,
+        'at': FieldValue.serverTimestamp(),
+      },
+    }, SetOptions(merge: true));
+  }
+
   void _startCooldownTicker() {
     _cooldownTicker?.cancel();
     _cooldownTicker = Timer.periodic(const Duration(seconds: 1), (_) async {
-      if (!mounted) return;
       if (_lastSendAt == null) return;
 
       final left = _cooldownLeft();
+
       if (left <= 0) {
         _lastSendAt = null;
         await _clearLastSendAt();
+        _cooldownNotifier.value = 0;
         if (mounted) setState(() {});
         return;
       }
-      setState(() {});
+
+      _cooldownNotifier.value = left;
     });
   }
 
@@ -189,15 +378,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   String _cooldownText() {
     final left = _cooldownLeft();
     if (left <= 0) return 'Hazır 💗 Gönderebilirsin.';
-
     final minutes = left ~/ 60;
     final seconds = left % 60;
-
     if (minutes > 0) {
       return 'Minik bir mola 💗 $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
-    } else {
-      return 'Minik bir mola 💗 $seconds sn sonra tekrar gönderebilirsin.';
     }
+    return 'Minik bir mola 💗 $seconds sn sonra tekrar gönderebilirsin.';
   }
 
   void _showCooldownSnack() {
@@ -209,26 +395,36 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-          content: Text(_cooldownText()), duration: const Duration(seconds: 2)),
+        content: Text(_cooldownText()),
+        duration: const Duration(seconds: 2),
+      ),
     );
   }
 
   void _refreshNotifState() {
-    if (!mounted) return;
-    setState(() => _notifEnabled = NotificationService.instance.hasPermission);
+    final next = NotificationService.instance.hasPermission;
+    if (!mounted || _notifEnabled == next) return;
+    setState(() => _notifEnabled = next);
   }
 
-  Future<bool> _updateLocationOnce({bool silent = false}) async {
+  Future<LocationUpdateResult> _updateLocationOnce({
+    bool silent = false,
+    bool forceRemoteWrite = false,
+  }) async {
     final uid = _uid;
-    if (uid == null) return false;
+    if (uid == null) return LocationUpdateResult.error;
 
     try {
+      if (mounted) {
+        setState(() => _error = null);
+      }
+
       final enabled = await Geolocator.isLocationServiceEnabled();
       if (!enabled) {
         if (!silent && mounted) {
           setState(() => _error = '📍 Konum servisleri kapalı.');
         }
-        return false;
+        return LocationUpdateResult.serviceDisabled;
       }
 
       var perm = await Geolocator.checkPermission();
@@ -239,34 +435,70 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) {
         if (!silent && mounted) {
-          setState(() => _error =
-              '🙈 Konum izni yok. İzin verirsen mesafeyi gösterebilirim.');
+          setState(() {
+            _error =
+                '🙈 Konum izni yok. İzin verirsen mesafeyi gösterebilirim.';
+          });
         }
-        return false;
+        return LocationUpdateResult.permissionDenied;
       }
 
       final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
+        desiredAccuracy: LocationAccuracy.medium,
       ).timeout(const Duration(seconds: 10));
 
-      await FirestoreService.instance.users.doc(uid).set({
-        'lastLocation': {
-          'lat': pos.latitude,
-          'lng': pos.longitude,
-          'at': FieldValue.serverTimestamp(),
-        },
-      }, SetOptions(merge: true));
+      Position? basePosition = _lastPosition;
+      basePosition ??= await _loadLastSavedPosition();
 
-      return true;
+      if (basePosition != null) {
+        final distance = Geolocator.distanceBetween(
+          basePosition.latitude,
+          basePosition.longitude,
+          pos.latitude,
+          pos.longitude,
+        );
+
+        if (distance < _minDistanceMeters) {
+          _lastPosition = pos;
+
+          if (forceRemoteWrite) {
+            await _saveLastPosition(pos);
+            await _writeLocationToFirestore(uid: uid, pos: pos);
+            _hasSyncedInitialLocation = true;
+
+            if (mounted) {
+              setState(() => _error = null);
+            }
+
+            return LocationUpdateResult.updated;
+          }
+
+          return LocationUpdateResult.unchanged;
+        }
+      }
+
+      _lastPosition = pos;
+      await _saveLastPosition(pos);
+      await _writeLocationToFirestore(uid: uid, pos: pos);
+      _hasSyncedInitialLocation = true;
+
+      if (mounted) {
+        setState(() => _error = null);
+      }
+
+      return LocationUpdateResult.updated;
     } on TimeoutException {
       if (!silent && mounted) {
-        setState(
-            () => _error = '⏳ Konum alınamadı. Birazdan tekrar dener misin?');
+        setState(() {
+          _error = '⏳ Konum alınamadı. Birazdan tekrar dener misin?';
+        });
       }
-      return false;
+      return LocationUpdateResult.timeout;
     } catch (e) {
-      if (!silent && mounted) setState(() => _error = trError(e));
-      return false;
+      if (!silent && mounted) {
+        setState(() => _error = trError(e));
+      }
+      return LocationUpdateResult.error;
     }
   }
 
@@ -276,9 +508,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final lng1 = (a['lng'] as num?)?.toDouble();
     final lat2 = (b['lat'] as num?)?.toDouble();
     final lng2 = (b['lng'] as num?)?.toDouble();
+
     if (lat1 == null || lng1 == null || lat2 == null || lng2 == null) {
       return null;
     }
+
     final meters = Geolocator.distanceBetween(lat1, lng1, lat2, lng2);
     return meters / 1000.0;
   }
@@ -312,14 +546,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     return _chatAllStream(myUid: myUid, partnerUid: partnerUid, limit: 1);
   }
 
-  void _killInteractionStreams() {
-    _partnerUidCached = null;
-    _partner$ = null;
-    _interactionKey = null;
-    _chatAll$ = null;
-    _incomingLastAll$ = null;
-  }
-
   void _ensurePartnerAndInteractionStreams({
     required String myUid,
     required String partnerUid,
@@ -329,28 +555,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final dk = _todayKeyGlobalUtc();
     final key = '$partnerUid|$dk';
 
-    bool changed = false;
+    final shouldUpdatePartner =
+        _partnerUidCached != partnerUid || _partner$ == null;
 
-    if (_partnerUidCached != partnerUid || _partner$ == null) {
-      _partnerUidCached = partnerUid;
-      _partner$ = FirestoreService.instance.users.doc(partnerUid).snapshots();
-      changed = true;
+    final shouldUpdateInteractions = _interactionKey != key ||
+        _chatAll$ == null ||
+        _incomingLastAll$ == null;
+
+    if (!shouldUpdatePartner && !shouldUpdateInteractions) {
+      return;
     }
 
-    if (_interactionKey != key ||
-        _chatAll$ == null ||
-        _incomingLastAll$ == null) {
+    if (shouldUpdatePartner) {
+      _partnerUidCached = partnerUid;
+      _partner$ = FirestoreService.instance.users.doc(partnerUid).snapshots();
+    }
+
+    if (shouldUpdateInteractions) {
       _interactionKey = key;
       _chatAll$ = _chatAllStream(myUid: myUid, partnerUid: partnerUid);
       _incomingLastAll$ =
           _incomingLastAllStream(myUid: myUid, partnerUid: partnerUid);
-      changed = true;
-    }
-
-    if (changed && mounted) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) setState(() {});
-      });
     }
   }
 
@@ -381,130 +606,115 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     required String partnerUid,
   }) async {
     final users = FirestoreService.instance.users;
+    final db = FirestoreService.instance.db;
     final today = _todayKeyGlobalUtc();
-
     final myRef = users.doc(myUid);
     final partnerRef = users.doc(partnerUid);
 
-    final mySnap = await myRef.get();
-    final partnerSnap = await partnerRef.get();
-
-    final me = mySnap.data() ?? <String, dynamic>{};
-    final partner = partnerSnap.data() ?? <String, dynamic>{};
-
-    final currentKey = _asStr(me['dailyKey']);
-
-    final mePairedTo = _asStr(me['pairedUserId']);
-    final partnerPairedTo = _asStr(partner['pairedUserId']);
-    final partnerOk = mePairedTo == partnerUid &&
-        partnerPairedTo == myUid &&
-        (partner['isPaired'] == true);
-
-    final batch = FirestoreService.instance.db.batch();
-
-    if (currentKey.isEmpty) {
-      batch.set(
-          myRef,
-          {'dailyKey': today, 'dailyHearts': 0, 'dailyMessages': 0},
-          SetOptions(merge: true));
-      if (partnerOk) {
-        batch.set(
-            partnerRef,
-            {'dailyKey': today, 'dailyHearts': 0, 'dailyMessages': 0},
-            SetOptions(merge: true));
-      }
-      try {
-        await batch.commit();
-      } catch (e) {
-        if (_isIgnorableCommitRace(e)) return;
-        rethrow;
-      }
-      return;
-    }
-
-    if (currentKey == today) return;
-
-    final yKey = currentKey;
-
-    final meLast = _asStr(me['lastResultDayKey']);
-    final pLast = _asStr(partner['lastResultDayKey']);
-    final alreadyComputed = (meLast == yKey) || (pLast == yKey);
-
-    if (!alreadyComputed && partnerOk) {
-      final myScore = _asInt(me['dailyHearts']) + _asInt(me['dailyMessages']);
-      final pScore =
-          _asInt(partner['dailyHearts']) + _asInt(partner['dailyMessages']);
-
-      final myIsWinner = myScore > pScore;
-      final pIsWinner = pScore > myScore;
-
-      final myPrevStreak = _asInt(me['winnerStreak']);
-      final pPrevStreak = _asInt(partner['winnerStreak']);
-      final myPrevWins = _asInt(me['totalWins']);
-      final pPrevWins = _asInt(partner['totalWins']);
-
-      batch.set(
-        myRef,
-        {
-          'lastResultDayKey': yKey,
-          'winnerToday': myIsWinner,
-          'winnerStreak': myIsWinner ? (myPrevStreak + 1) : 0,
-          'totalWins': myIsWinner ? (myPrevWins + 1) : myPrevWins,
-        },
-        SetOptions(merge: true),
-      );
-
-      batch.set(
-        partnerRef,
-        {
-          'lastResultDayKey': yKey,
-          'winnerToday': pIsWinner,
-          'winnerStreak': pIsWinner ? (pPrevStreak + 1) : 0,
-          'totalWins': pIsWinner ? (pPrevWins + 1) : pPrevWins,
-        },
-        SetOptions(merge: true),
-      );
-    }
-
-    batch.set(myRef, {'dailyKey': today, 'dailyHearts': 0, 'dailyMessages': 0},
-        SetOptions(merge: true));
-    if (partnerOk) {
-      batch.set(
-          partnerRef,
-          {'dailyKey': today, 'dailyHearts': 0, 'dailyMessages': 0},
-          SetOptions(merge: true));
-    }
-
     try {
-      await batch.commit();
+      await db.runTransaction((tx) async {
+        final mySnap = await tx.get(myRef);
+        final partnerSnap = await tx.get(partnerRef);
+
+        final me = mySnap.data() ?? <String, dynamic>{};
+        final partner = partnerSnap.data() ?? <String, dynamic>{};
+
+        final currentKey = _asStr(me['dailyKey']);
+
+        if (currentKey == today) return;
+
+        if (currentKey.isEmpty) {
+          tx.update(myRef, {
+            'dailyKey': today,
+            'dailyHearts': 0,
+            'dailyMessages': 0,
+          });
+          return;
+        }
+
+        final myScore = _asInt(me['dailyHearts']) + _asInt(me['dailyMessages']);
+        final pScore =
+            _asInt(partner['dailyHearts']) + _asInt(partner['dailyMessages']);
+
+        final myIsWinner = myScore > pScore;
+        final pIsWinner = pScore > myScore;
+
+        tx.update(myRef, {
+          'lastResultDayKey': currentKey,
+          'winnerToday': myIsWinner,
+          'totalWins': myIsWinner
+              ? (_asInt(me['totalWins']) + 1)
+              : _asInt(me['totalWins']),
+          'dailyKey': today,
+          'dailyHearts': 0,
+          'dailyMessages': 0,
+        });
+
+        tx.update(partnerRef, {
+          'lastResultDayKey': currentKey,
+          'winnerToday': pIsWinner,
+          'totalWins': pIsWinner
+              ? (_asInt(partner['totalWins']) + 1)
+              : _asInt(partner['totalWins']),
+          'dailyKey': today,
+          'dailyHearts': 0,
+          'dailyMessages': 0,
+        });
+      });
     } catch (e) {
-      if (_isIgnorableCommitRace(e)) return;
-      rethrow;
+      if (!_isIgnorableCommitRace(e)) rethrow;
     }
   }
 
   void _spawnHearts() {
+    if (_hearts.length > 20) return;
+    final newHearts = <_FlyingHeart>[];
+
     for (int i = 0; i < 10; i++) {
-      final c = AnimationController(
+      final controller = AnimationController(
         vsync: this,
         duration: Duration(milliseconds: 900 + _rand.nextInt(500)),
       );
 
-      final h = _FlyingHeart(
+      final heart = _FlyingHeart(
         id: DateTime.now().microsecondsSinceEpoch + i,
         x: 0.20 + _rand.nextDouble() * 0.60,
-        controller: c,
+        controller: controller,
       );
 
-      c.addStatusListener((s) {
-        if (s == AnimationStatus.completed) {
-          c.dispose();
-          if (mounted) setState(() => _hearts.removeWhere((x) => x.id == h.id));
+      controller.addStatusListener((status) {
+        if (status == AnimationStatus.completed) {
+          controller.dispose();
+          if (mounted) {
+            setState(() => _hearts.removeWhere((x) => x.id == heart.id));
+          }
         }
       });
 
-      setState(() => _hearts.add(h));
-      c.forward();
+      newHearts.add(heart);
+      controller.forward();
+    }
+
+    setState(() {
+      _hearts.addAll(newHearts);
+    });
+  }
+
+  Future<void> _setMood({required MoodOption mood}) async {
+    final myUid = _uid;
+    if (myUid == null || _unpairing) return;
+
+    try {
+      await FirestoreService.instance.users.doc(myUid).set({
+        'mood': {
+          'key': mood.key,
+          'emoji': mood.emoji,
+          'label': mood.label,
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+      }, SetOptions(merge: true));
+    } catch (e) {
+      if (mounted) setState(() => _error = trError(e));
     }
   }
 
@@ -513,17 +723,25 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     required Map<String, dynamic> partner,
     required String partnerUid,
   }) async {
-    final partnerFirst = _asStr(partner['firstName']);
-    final name = partnerFirst.isEmpty ? 'Aşkım' : partnerFirst;
-    final msg = await LoveMessages.randomFor(name);
+    if (_heartTapLocked || _sending || _unpairing) return;
 
-    await _sendInteraction(
-      me: me,
-      partner: partner,
-      partnerUid: partnerUid,
-      type: 'heart',
-      message: msg,
-    );
+    _heartTapLocked = true;
+
+    try {
+      final partnerFirst = _asStr(partner['firstName']);
+      final name = partnerFirst.isEmpty ? 'Aşkım' : partnerFirst;
+      final msg = await LoveMessages.randomFor(name);
+
+      await _sendInteraction(
+        me: me,
+        partner: partner,
+        partnerUid: partnerUid,
+        type: 'heart',
+        message: msg,
+      );
+    } finally {
+      _heartTapLocked = false;
+    }
   }
 
   Future<void> _sendManual({
@@ -531,23 +749,31 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     required Map<String, dynamic> partner,
     required String partnerUid,
   }) async {
-    final t = _manual.text.trim();
-    if (t.isEmpty) return;
+    if (_messageTapLocked || _sending || _unpairing) return;
+
+    final text = _manual.text.trim();
+    if (text.isEmpty) return;
 
     if (_isCoolingDown()) {
       _showCooldownSnack();
       return;
     }
 
-    _manual.clear();
+    _messageTapLocked = true;
 
-    await _sendInteraction(
-      me: me,
-      partner: partner,
-      partnerUid: partnerUid,
-      type: 'message',
-      message: t,
-    );
+    try {
+      _manual.clear();
+
+      await _sendInteraction(
+        me: me,
+        partner: partner,
+        partnerUid: partnerUid,
+        type: 'message',
+        message: text,
+      );
+    } finally {
+      _messageTapLocked = false;
+    }
   }
 
   Future<void> _sendInteraction({
@@ -558,8 +784,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     required String message,
   }) async {
     final myUid = _uid;
-    if (myUid == null) return;
-    if (_unpairing) return;
+    if (myUid == null || _unpairing) return;
 
     if (_isCoolingDown()) {
       _showCooldownSnack();
@@ -581,32 +806,25 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final pid = _pairId(myUid, partnerUid);
       final createdAtMs = DateTime.now().millisecondsSinceEpoch;
 
-      batch.set(
-        users.doc(myUid),
-        {
-          'dailyKey': dayKey,
-          if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
-          if (type == 'message') 'dailyMessages': FieldValue.increment(1),
-          if (type == 'heart') 'totalHearts': FieldValue.increment(1),
-          if (type == 'message') 'totalMessages': FieldValue.increment(1),
-        },
-        SetOptions(merge: true),
-      );
+      batch.update(users.doc(myUid), {
+        'dailyKey': dayKey,
+        if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
+        if (type == 'message') 'dailyMessages': FieldValue.increment(1),
+        if (type == 'heart') 'totalHearts': FieldValue.increment(1),
+        if (type == 'message') 'totalMessages': FieldValue.increment(1),
+      });
 
-      batch.set(
-        FirestoreService.instance.interactions.doc(),
-        {
-          'pairId': pid,
-          'dayKey': dayKey,
-          'createdAtMs': createdAtMs,
-          'type': type,
-          'message': message,
-          'createdAt': FieldValue.serverTimestamp(),
-          'fromUid': myUid,
-          'toUid': partnerUid,
-          'members': [myUid, partnerUid],
-        },
-      );
+      batch.set(FirestoreService.instance.interactions.doc(), {
+        'pairId': pid,
+        'dayKey': dayKey,
+        'createdAtMs': createdAtMs,
+        'type': type,
+        'message': message,
+        'createdAt': FieldValue.serverTimestamp(),
+        'fromUid': myUid,
+        'toUid': partnerUid,
+        'members': [myUid, partnerUid],
+      });
 
       await batch.commit();
 
@@ -622,10 +840,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       );
 
       _lastSendAt = DateTime.now();
+      _cooldownNotifier.value = _cooldownLeft();
       await _saveLastSendAt(_lastSendAt!);
 
       _spawnHearts();
-      if (mounted) setState(() {});
     } catch (e) {
       if (mounted) setState(() => _error = trError(e));
     } finally {
@@ -645,14 +863,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       _showHistory = false;
     });
 
-    _killInteractionStreams();
-    if (mounted) setState(() {});
-
     final db = FirestoreService.instance.db;
     final users = FirestoreService.instance.users;
     final pairCodes = db.collection('pairCodes');
     final interactions = FirestoreService.instance.interactions;
-
     final pid = _pairId(myUid, partnerUid);
 
     final newMyCode = PairingService.generateCode(length: 6);
@@ -686,6 +900,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         if (!snap.exists) return;
         final data = snap.data() ?? <String, dynamic>{};
         final ownerUid = _asStr(data['uid']);
+
         await ref.set({
           'uid': ownerUid,
           'active': false,
@@ -705,9 +920,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           if (!snap.exists) return;
           final data = snap.data() ?? <String, dynamic>{};
           final active = data['active'] == true;
-          if (!active) {
-            await ref.delete();
-          }
+          if (!active) await ref.delete();
         } catch (_) {}
       }
 
@@ -743,18 +956,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       };
 
       final b2 = db.batch();
-      b2.set(users.doc(myUid), {...reset, 'pairCode': newMyCode},
-          SetOptions(merge: true));
-      b2.set(users.doc(partnerUid), {...reset, 'pairCode': newPartnerCode},
-          SetOptions(merge: true));
+      b2.set(
+        users.doc(myUid),
+        {...reset, 'pairCode': newMyCode},
+        SetOptions(merge: true),
+      );
+      b2.set(
+        users.doc(partnerUid),
+        {...reset, 'pairCode': newPartnerCode},
+        SetOptions(merge: true),
+      );
       await b2.commit();
 
       if (!mounted) return;
-      Navigator.pushAndRemoveUntil(
-        context,
-        MaterialPageRoute(builder: (_) => const PairingScreen()),
-        (_) => false,
-      );
+
+      Future.microtask(() {
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(builder: (_) => const PairingScreen()),
+          (_) => false,
+        );
+      });
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -786,7 +1008,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         final partnerUid = _asStr(me['pairedUserId']);
 
         if (me['isPaired'] != true || partnerUid.isEmpty) {
-          if (!mySnap.data!.metadata.isFromCache) {
+          if (!_didNavigateToPairing && !mySnap.data!.metadata.isFromCache) {
+            _didNavigateToPairing = true;
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (!mounted) return;
               Navigator.pushAndRemoveUntil(
@@ -796,8 +1019,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               );
             });
           }
+
           return const Scaffold(
-              body: Center(child: CircularProgressIndicator()));
+            body: Center(child: CircularProgressIndicator()),
+          );
         }
 
         _ensurePartnerAndInteractionStreams(
@@ -818,9 +1043,29 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             }
 
             final partner = pSnap.data!.data() ?? {};
-
             final myGender = _asStr(me['gender']);
             final partnerGender = _asStr(partner['gender']);
+
+            final myMood = me['mood'] is Map
+                ? Map<String, dynamic>.from(me['mood'] as Map)
+                : <String, dynamic>{};
+
+            final partnerMood = partner['mood'] is Map
+                ? Map<String, dynamic>.from(partner['mood'] as Map)
+                : <String, dynamic>{};
+
+            final myMoodKey = _asStr(myMood['key']);
+            final myMoodEmoji = _asStr(myMood['emoji']);
+            final myMoodLabel = _asStr(myMood['label']);
+            final partnerMoodKey = _asStr(partnerMood['key']);
+            final partnerMoodEmoji = _asStr(partnerMood['emoji']);
+            final partnerMoodLabel = _asStr(partnerMood['label']);
+            final myMoodUpdatedAt = myMood['updatedAt'] is Timestamp
+                ? myMood['updatedAt'] as Timestamp
+                : null;
+            final partnerMoodUpdatedAt = partnerMood['updatedAt'] is Timestamp
+                ? partnerMood['updatedAt'] as Timestamp
+                : null;
 
             if (!_didInitialAutoRollover && !_rolloverRunning) {
               _didInitialAutoRollover = true;
@@ -855,13 +1100,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
             final myName =
                 '${_asStr(me['firstName'])} ${_asStr(me['lastName'])}'.trim();
-            final pName =
+            final partnerName =
                 '${_asStr(partner['firstName'])} ${_asStr(partner['lastName'])}'
                     .trim();
 
             final myLoc = me['lastLocation'] as Map<String, dynamic>?;
-            final pLoc = partner['lastLocation'] as Map<String, dynamic>?;
-            final km = _calcKm(myLoc, pLoc);
+            final partnerLoc = partner['lastLocation'] as Map<String, dynamic>?;
+            final km = _calcKm(myLoc, partnerLoc);
             final kmText = km == null ? '---' : km.toStringAsFixed(1);
 
             final days = _daysTogether(me['pairedAt'] as Timestamp?);
@@ -877,24 +1122,22 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             final pTotalMsgs = _asInt(partner['totalMessages']);
 
             final myTotalWins = _asInt(me['totalWins']);
-            final pTotalWins = _asInt(partner['totalWins']);
-
+            final partnerTotalWins = _asInt(partner['totalWins']);
             final myStreak = _asInt(me['winnerStreak']);
-            final pStreak = _asInt(partner['winnerStreak']);
+            final partnerStreak = _asInt(partner['winnerStreak']);
 
             final meResKey = _asStr(me['lastResultDayKey']);
-            final pResKey = _asStr(partner['lastResultDayKey']);
-            final resultKey =
-                (meResKey.isNotEmpty && meResKey == pResKey) ? meResKey : '';
+            final partnerResKey = _asStr(partner['lastResultDayKey']);
+            final resultKey = (meResKey.isNotEmpty && meResKey == partnerResKey)
+                ? meResKey
+                : '';
 
             final myWinnerToday = _asBool(me['winnerToday']);
-            final pWinnerToday = _asBool(partner['winnerToday']);
-
+            final partnerWinnerToday = _asBool(partner['winnerToday']);
             final myIsWinner = resultKey.isNotEmpty && myWinnerToday;
-            final pIsWinner = resultKey.isNotEmpty && pWinnerToday;
-
+            final partnerIsWinner = resultKey.isNotEmpty && partnerWinnerToday;
             final didTie =
-                resultKey.isNotEmpty && !myWinnerToday && !pWinnerToday;
+                resultKey.isNotEmpty && !myWinnerToday && !partnerWinnerToday;
 
             final incoming$ = _incomingLastAll$;
             final chat$ = _chatAll$;
@@ -903,104 +1146,189 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               children: [
                 Scaffold(
                   appBar: AppBar(
-                    title: const Text('Ana Sayfa'),
+                    title: const Text('Aşk Paneli'),
+                    centerTitle: true,
                     actions: [
-                      TextButton.icon(
-                        onPressed: (_sending || _unpairing)
-                            ? null
-                            : () async {
-                                final ok =
-                                    await _updateLocationOnce(silent: false);
-                                if (!mounted) return;
-                                ScaffoldMessenger.of(context)
-                                    .hideCurrentSnackBar();
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text(ok
-                                        ? 'Konum güncellendi ✅'
-                                        : 'Konum güncellenemedi ❌'),
-                                    duration: const Duration(seconds: 2),
-                                  ),
-                                );
-                              },
-                        icon: const Icon(Icons.my_location_rounded,
+                      PopupMenuButton<String>(
+                        tooltip: 'Menü',
+                        icon: const Icon(Icons.more_vert_rounded,
                             color: AppTheme.primary),
-                        label: const Text('GPS',
-                            style: TextStyle(
-                                color: AppTheme.primary,
-                                fontWeight: FontWeight.w900)),
-                      ),
-                      const SizedBox(width: 6),
-                      TextButton.icon(
-                        onPressed: _unpairing
-                            ? null
-                            : () async {
-                                final uid = _uid;
-                                if (uid == null) return;
+                        onSelected: (value) async {
+                          if (value == 'gps' && !_sending && !_unpairing) {
+                            final result = await _updateLocationOnce(
+                              silent: false,
+                              forceRemoteWrite: true,
+                            );
 
-                                final ok = await NotificationService.instance
-                                    .requestPermissionAndRegisterToken(
-                                        uid: uid);
+                            if (result == LocationUpdateResult.updated ||
+                                result == LocationUpdateResult.unchanged) {
+                              await _startAutoLocationUpdates();
+                            }
 
-                                if (!mounted) return;
-                                _refreshNotifState();
+                            if (!mounted) return;
 
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text(ok
-                                        ? 'Bildirimler açıldı ✅'
-                                        : 'Bildirim izni verildi ama token alınamadı.'),
+                            String message;
+                            switch (result) {
+                              case LocationUpdateResult.updated:
+                                message = 'Konum güncellendi ✅';
+                                break;
+                              case LocationUpdateResult.unchanged:
+                                message = 'Konum zaten güncel görünüyor. 📍';
+                                break;
+                              case LocationUpdateResult.serviceDisabled:
+                              case LocationUpdateResult.permissionDenied:
+                              case LocationUpdateResult.timeout:
+                              case LocationUpdateResult.error:
+                                message = _error?.isNotEmpty == true
+                                    ? _error!
+                                    : 'Konum güncellenemedi ❌';
+                                break;
+                            }
+
+                            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text(message)),
+                            );
+
+                            if (mounted) {
+                              setState(() => _error = null);
+                            }
+                          } else if (value == 'notif' && !_unpairing) {
+                            final uid = _uid;
+                            if (uid == null) return;
+                            final ok = await NotificationService.instance
+                                .requestPermissionAndRegisterToken(
+                              uid: uid,
+                            );
+                            if (!mounted) return;
+                            _refreshNotifState();
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                  content: Text(ok
+                                      ? 'Bildirimler açıldı ✅'
+                                      : 'Token alınamadı.')),
+                            );
+                          } else if (value == 'theme_light') {
+                            await ThemeController.instance
+                                .setMode(AppThemeMode.light);
+                          } else if (value == 'theme_dark') {
+                            await ThemeController.instance
+                                .setMode(AppThemeMode.dark);
+                          } else if (value == 'unpair' && !_unpairing) {
+                            final ok = await showDialog<bool>(
+                              context: context,
+                              builder: (c) => AlertDialog(
+                                title: const Text('Eşleşmeyi kaldır?'),
+                                content: const Text(
+                                  'İki tarafta da her şey sıfırlanır.\nMesajlar silinir, eski kodlar pasife çekilir.',
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(c, false),
+                                    child: const Text('Vazgeç'),
                                   ),
-                                );
-                              },
-                        icon: Icon(
-                          _notifEnabled
-                              ? Icons.notifications_active_rounded
-                              : Icons.notifications_off_rounded,
-                          color: AppTheme.primary,
-                        ),
-                        label: const Text('Bildirimleri Aç',
-                            style: TextStyle(
-                                color: AppTheme.primary,
-                                fontWeight: FontWeight.w900)),
-                      ),
-                      const SizedBox(width: 6),
-                      TextButton.icon(
-                        onPressed: _unpairing
-                            ? null
-                            : () async {
-                                final ok = await showDialog<bool>(
-                                  context: context,
-                                  builder: (c) => AlertDialog(
-                                    title: const Text('Eşleşmeyi kaldır?'),
-                                    content: const Text(
-                                        'İki tarafta da her şey sıfırlanır.\nMesajlar silinir, eski kodlar pasife çekilir.'),
-                                    actions: [
-                                      TextButton(
-                                          onPressed: () =>
-                                              Navigator.pop(c, false),
-                                          child: const Text('Vazgeç')),
-                                      ElevatedButton(
-                                          onPressed: () =>
-                                              Navigator.pop(c, true),
-                                          child: const Text('Kaldır')),
-                                    ],
+                                  ElevatedButton(
+                                    onPressed: () => Navigator.pop(c, true),
+                                    child: const Text('Kaldır'),
                                   ),
-                                );
-                                if (ok == true) {
-                                  await _unpair(
-                                      myUid: myUid, partnerUid: partnerUid);
-                                }
-                              },
-                        icon: const Icon(Icons.link_off_rounded,
-                            color: AppTheme.primary),
-                        label: Text(
-                            _unpairing ? 'Kaldırılıyor…' : 'Eşleşmeyi Kaldır',
-                            style: const TextStyle(
-                                color: AppTheme.primary,
-                                fontWeight: FontWeight.w900)),
+                                ],
+                              ),
+                            );
+                            if (ok == true &&
+                                _uid != null &&
+                                _partnerUidCached != null) {
+                              await _unpair(
+                                  myUid: _uid!, partnerUid: _partnerUidCached!);
+                            }
+                          }
+                        },
+                        itemBuilder: (BuildContext context) {
+                          final isDark =
+                              Theme.of(context).brightness == Brightness.dark;
+
+                          return <PopupMenuEntry<String>>[
+                            const PopupMenuItem<String>(
+                              value: 'gps',
+                              child: Row(
+                                children: [
+                                  Icon(Icons.my_location_rounded,
+                                      color: AppTheme.primary),
+                                  SizedBox(width: 10),
+                                  Text('GPS Güncelle',
+                                      style: TextStyle(
+                                          fontWeight: FontWeight.bold)),
+                                ],
+                              ),
+                            ),
+                            PopupMenuItem<String>(
+                              value: 'notif',
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    _notifEnabled
+                                        ? Icons.notifications_active_rounded
+                                        : Icons.notifications_off_rounded,
+                                    color: AppTheme.primary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  const Text(
+                                    'Bildirimleri Aç',
+                                    style:
+                                        TextStyle(fontWeight: FontWeight.bold),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const PopupMenuDivider(),
+                            if (isDark)
+                              const PopupMenuItem<String>(
+                                value: 'theme_light',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.light_mode_rounded,
+                                        color: AppTheme.primary),
+                                    SizedBox(width: 10),
+                                    Text('Açık Tema',
+                                        style: TextStyle(
+                                            fontWeight: FontWeight.bold)),
+                                  ],
+                                ),
+                              )
+                            else
+                              const PopupMenuItem<String>(
+                                value: 'theme_dark',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.dark_mode_rounded,
+                                        color: AppTheme.primary),
+                                    SizedBox(width: 10),
+                                    Text('Koyu Tema',
+                                        style: TextStyle(
+                                            fontWeight: FontWeight.bold)),
+                                  ],
+                                ),
+                              ),
+                            const PopupMenuDivider(),
+                            const PopupMenuItem<String>(
+                              value: 'unpair',
+                              child: Row(
+                                children: [
+                                  Icon(Icons.link_off_rounded,
+                                      color: Colors.red),
+                                  SizedBox(width: 10),
+                                  Text(
+                                    'Eşleşmeyi Kaldır',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.red,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ];
+                        },
                       ),
-                      const SizedBox(width: 6),
                     ],
                   ),
                   body: ListView(
@@ -1009,19 +1337,19 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                       Card(
                         child: Padding(
                           padding: const EdgeInsets.all(16),
-                          child: _HeaderBlock(
+                          child: HomeHeaderCard(
                             myName: myName,
-                            partnerName: pName,
+                            partnerName: partnerName,
                             myGender: myGender,
                             partnerGender: partnerGender,
                             kmText: kmText,
                             days: days,
                             myIsWinner: myIsWinner,
-                            pIsWinner: pIsWinner,
+                            partnerIsWinner: partnerIsWinner,
                             myStreak: myStreak,
-                            partnerStreak: pStreak,
+                            partnerStreak: partnerStreak,
                             myTotalWins: myTotalWins,
-                            partnerTotalWins: pTotalWins,
+                            partnerTotalWins: partnerTotalWins,
                             didTieYesterday: didTie,
                           ),
                         ),
@@ -1049,20 +1377,45 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                               dailyMsgs: pDailyMsgs,
                               totalHearts: pTotalHearts,
                               totalMsgs: pTotalMsgs,
-                              winner: pIsWinner,
+                              winner: partnerIsWinner,
                             ),
                           ),
                         ],
                       ),
+                      const SizedBox(height: 12),
+                      MoodCard(
+                        title: 'Senin Ruh Halin',
+                        selectedMoodKey: myMoodKey.isEmpty ? null : myMoodKey,
+                        selectedMoodEmoji:
+                            myMoodEmoji.isEmpty ? null : myMoodEmoji,
+                        selectedMoodLabel:
+                            myMoodLabel.isEmpty ? null : myMoodLabel,
+                        updatedAt: myMoodUpdatedAt,
+                        editable: true,
+                        onMoodTap: (mood) => _setMood(mood: mood),
+                      ),
+                      const SizedBox(height: 10),
+                      MoodCard(
+                        title: 'Partnerinin Ruh Hali',
+                        selectedMoodKey:
+                            partnerMoodKey.isEmpty ? null : partnerMoodKey,
+                        selectedMoodEmoji:
+                            partnerMoodEmoji.isEmpty ? null : partnerMoodEmoji,
+                        selectedMoodLabel:
+                            partnerMoodLabel.isEmpty ? null : partnerMoodLabel,
+                        updatedAt: partnerMoodUpdatedAt,
+                        editable: false,
+                      ),
                       const SizedBox(height: 18),
                       Center(
                         child: GestureDetector(
-                          onTap: (_sending || _unpairing)
+                          onTap: (_sending || _unpairing || _heartTapLocked)
                               ? null
                               : () => _sendHeart(
-                                  me: me,
-                                  partner: partner,
-                                  partnerUid: partnerUid),
+                                    me: me,
+                                    partner: partner,
+                                    partnerUid: partnerUid,
+                                  ),
                           child: Container(
                             width: 200,
                             height: 200,
@@ -1088,14 +1441,23 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         ),
                       ),
                       const SizedBox(height: 10),
-                      Text(
-                        _unpairing
-                            ? 'Eşleşme kaldırılıyor… 🧹'
-                            : _cooldownText(),
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                            fontWeight: FontWeight.w800,
-                            color: Colors.black.withAlpha(150)),
+                      ValueListenableBuilder<int>(
+                        valueListenable: _cooldownNotifier,
+                        builder: (_, __, ___) {
+                          return Text(
+                            _unpairing
+                                ? 'Eşleşme kaldırılıyor… 🧹'
+                                : _cooldownText(),
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontWeight: FontWeight.w800,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withAlpha(180),
+                            ),
+                          );
+                        },
                       ),
                       const SizedBox(height: 12),
                       if (incoming$ == null)
@@ -1108,107 +1470,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                           ),
                         )
                       else
-                        StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        LastMessageWidget(
                           stream: incoming$,
-                          builder: (context, snap) {
-                            if (snap.hasError) {
-                              final err = trError(snap.error!);
-                              return Card(
-                                child: ListTile(
-                                  title: const Text('Son mesaj',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.w900)),
-                                  subtitle: Text('Mesajlar yüklenemedi.\n$err',
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.w800)),
-                                ),
-                              );
-                            }
-
-                            if (snap.connectionState ==
-                                ConnectionState.waiting) {
-                              return const Card(
-                                child: ListTile(
-                                  title: Text('Son mesaj',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.w900)),
-                                  subtitle: Text('Yükleniyor…',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.w800)),
-                                ),
-                              );
-                            }
-
-                            String lastText = '';
-                            String lastWho = '';
-                            IconData? lastIcon;
-                            Color? lastColor;
-
-                            final docs = snap.data?.docs ?? const [];
-                            if (docs.isNotEmpty) {
-                              final d = docs.first.data();
-                              lastText = _asStr(d['message']);
-                              final fromUid = _asStr(d['fromUid']);
-                              final isMe = fromUid == myUid;
-                              lastWho = isMe ? 'Sen' : 'Partner';
-
-                              final senderGender =
-                                  isMe ? myGender : partnerGender;
-                              final isFem = senderGender == 'kadin';
-                              lastIcon = isFem
-                                  ? Icons.woman_rounded
-                                  : Icons.man_rounded;
-                              lastColor = isFem ? Colors.pink : Colors.blue;
-                            }
-
-                            final shown = lastText.isNotEmpty
-                                ? '$lastWho: $lastText'
-                                : '';
-
-                            return Card(
-                              child: ListTile(
-                                leading: lastIcon != null
-                                    ? Icon(lastIcon, color: lastColor)
-                                    : null,
-                                title: const Text('Son mesaj',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w900)),
-                                subtitle: Text(
-                                  shown.isNotEmpty
-                                      ? shown
-                                      : 'Henüz bir mesaj yok 💗',
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.w800),
-                                ),
-                                trailing: InkWell(
-                                  borderRadius: BorderRadius.circular(999),
-                                  onTap: _unpairing
-                                      ? null
-                                      : () => setState(
-                                          () => _showHistory = !_showHistory),
-                                  child: Container(
-                                    width: 42,
-                                    height: 42,
-                                    decoration: BoxDecoration(
-                                      color: AppTheme.primary.withAlpha(18),
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                          color:
-                                              AppTheme.primary.withAlpha(60)),
-                                    ),
-                                    child: Icon(
-                                      _showHistory
-                                          ? Icons.remove_rounded
-                                          : Icons.add_rounded,
-                                      color: AppTheme.primary,
-                                      size: 26,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            );
+                          myUid: myUid,
+                          showHistory: _showHistory,
+                          isDisabled: _unpairing,
+                          onToggleHistory: () {
+                            if (_unpairing) return;
+                            setState(() => _showHistory = !_showHistory);
                           },
                         ),
                       if (_showHistory) ...[
@@ -1218,192 +1487,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                             padding: const EdgeInsets.all(12),
                             child: SizedBox(
                               height: 280,
-                              child: (chat$ == null)
+                              child: chat$ == null
                                   ? const Center(
                                       child: CircularProgressIndicator())
-                                  : StreamBuilder<
-                                      QuerySnapshot<Map<String, dynamic>>>(
+                                  : ChatHistoryWidget(
                                       stream: chat$,
-                                      builder: (context, snap) {
-                                        if (snap.hasError) {
-                                          final err = trError(snap.error!);
-                                          return Center(
-                                            child: Text('Hata: $err',
-                                                textAlign: TextAlign.center,
-                                                style: const TextStyle(
-                                                    color: Colors.red,
-                                                    fontWeight:
-                                                        FontWeight.w900)),
-                                          );
-                                        }
-                                        if (snap.connectionState ==
-                                            ConnectionState.waiting) {
-                                          return const Center(
-                                              child:
-                                                  CircularProgressIndicator());
-                                        }
-                                        final docs =
-                                            snap.data?.docs ?? const [];
-                                        if (docs.isEmpty) {
-                                          return const Text('Mesaj yok.',
-                                              style: TextStyle(
-                                                  fontWeight: FontWeight.w800));
-                                        }
-
-                                        return ListView.separated(
-                                          itemCount: docs.length,
-                                          separatorBuilder: (_, __) => Divider(
-                                              color: Colors.black.withAlpha(10),
-                                              height: 1),
-                                          itemBuilder: (context, i) {
-                                            final d = docs[i].data();
-                                            final msg = _asStr(d['message']);
-                                            final type = _asStr(d['type']);
-                                            final fromUid =
-                                                _asStr(d['fromUid']);
-
-                                            final isMe = fromUid == myUid;
-                                            final who =
-                                                isMe ? 'Sen' : 'Partner';
-
-                                            final senderGender =
-                                                isMe ? myGender : partnerGender;
-                                            final isFem =
-                                                senderGender == 'kadin';
-                                            final genderIcon = isFem
-                                                ? Icons.woman_rounded
-                                                : Icons.man_rounded;
-                                            final genderColor = isFem
-                                                ? Colors.pink
-                                                : Colors.blue;
-
-                                            final isHeart = type == 'heart';
-                                            final typeIcon = isHeart
-                                                ? Icons.favorite_rounded
-                                                : Icons.chat_bubble_rounded;
-                                            final typeColor = isHeart
-                                                ? Colors.redAccent
-                                                : Colors.blueGrey;
-
-                                            return Padding(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                      vertical: 8,
-                                                      horizontal: 4),
-                                              child: Row(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
-                                                children: [
-                                                  CircleAvatar(
-                                                    radius: 16,
-                                                    backgroundColor: genderColor
-                                                        .withAlpha(30),
-                                                    child: Icon(genderIcon,
-                                                        color: genderColor,
-                                                        size: 20),
-                                                  ),
-                                                  const SizedBox(width: 12),
-                                                  Expanded(
-                                                    child: Column(
-                                                      crossAxisAlignment:
-                                                          CrossAxisAlignment
-                                                              .start,
-                                                      children: [
-                                                        Row(
-                                                          children: [
-                                                            Text(
-                                                              who,
-                                                              style: TextStyle(
-                                                                color:
-                                                                    genderColor,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w900,
-                                                                fontSize: 13,
-                                                              ),
-                                                            ),
-                                                            const SizedBox(
-                                                                width: 8),
-                                                            Icon(typeIcon,
-                                                                size: 12,
-                                                                color: typeColor
-                                                                    .withAlpha(
-                                                                        180)),
-                                                          ],
-                                                        ),
-                                                        const SizedBox(
-                                                            height: 4),
-                                                        Container(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .all(10),
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            color: isMe
-                                                                ? Colors.grey
-                                                                    .shade100
-                                                                : genderColor
-                                                                    .withAlpha(
-                                                                        15),
-                                                            borderRadius:
-                                                                BorderRadius
-                                                                    .only(
-                                                              topRight:
-                                                                  const Radius
-                                                                      .circular(
-                                                                      12),
-                                                              bottomLeft:
-                                                                  const Radius
-                                                                      .circular(
-                                                                      12),
-                                                              bottomRight:
-                                                                  const Radius
-                                                                      .circular(
-                                                                      12),
-                                                              topLeft: isMe
-                                                                  ? const Radius
-                                                                      .circular(
-                                                                      0)
-                                                                  : const Radius
-                                                                      .circular(
-                                                                      0),
-                                                            ),
-                                                            border: Border.all(
-                                                                color: Colors
-                                                                    .black
-                                                                    .withAlpha(
-                                                                        5)),
-                                                          ),
-                                                          child: Text(
-                                                            msg.isEmpty
-                                                                ? (isHeart
-                                                                    ? 'Sana bir kalp gönderdi!'
-                                                                    : '...')
-                                                                : msg,
-                                                            style: TextStyle(
-                                                              color: isHeart
-                                                                  ? Colors.red
-                                                                      .shade900
-                                                                  : Colors
-                                                                      .black87,
-                                                              fontWeight: isHeart
-                                                                  ? FontWeight
-                                                                      .w800
-                                                                  : FontWeight
-                                                                      .w600,
-                                                              fontSize: 14,
-                                                            ),
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            );
-                                          },
-                                        );
-                                      },
+                                      myUid: myUid,
+                                      myGender: myGender,
+                                      partnerGender: partnerGender,
                                     ),
                             ),
                           ),
@@ -1411,10 +1502,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                       ],
                       if (_error != null) ...[
                         const SizedBox(height: 10),
-                        Text(_error!,
-                            style: const TextStyle(
-                                color: Colors.red,
-                                fontWeight: FontWeight.w900)),
+                        Text(
+                          _error!,
+                          style: const TextStyle(
+                              color: Colors.red, fontWeight: FontWeight.w900),
+                        ),
                       ],
                       const SizedBox(height: 16),
                       Card(
@@ -1434,12 +1526,15 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                               ),
                               const SizedBox(width: 10),
                               ElevatedButton(
-                                onPressed: (_sending || _unpairing)
+                                onPressed: (_sending ||
+                                        _unpairing ||
+                                        _messageTapLocked)
                                     ? null
                                     : () => _sendManual(
-                                        me: me,
-                                        partner: partner,
-                                        partnerUid: partnerUid),
+                                          me: me,
+                                          partner: partner,
+                                          partnerUid: partnerUid,
+                                        ),
                                 child: const Text('Gönder'),
                               ),
                             ],
@@ -1482,7 +1577,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             end: Alignment.bottomRight,
             colors: [
               themeColor.withAlpha(20),
-              Colors.white,
+              Theme.of(context).cardColor,
             ],
           ),
         ),
@@ -1494,232 +1589,41 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               children: [
                 Icon(icon, size: 22, color: themeColor),
                 const SizedBox(width: 6),
-                Text('$title$badge',
-                    style: TextStyle(
-                        fontWeight: FontWeight.w900, color: themeColor)),
+                Text(
+                  '$title$badge',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w900,
+                    color: themeColor,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            Text('💗 Kalp: $dailyHearts (Toplam: $totalHearts)',
+            Text('💗 Kalp: $dailyHearts',
                 style:
                     const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+            Text(' (Toplam: $totalHearts)',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withAlpha(160))),
             const SizedBox(height: 6),
-            Text('💬 Mesaj: $dailyMsgs (Toplam: $totalMsgs)',
+            Text('💬 Mesaj: $dailyMsgs',
                 style:
                     const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+            Text(' (Toplam: $totalMsgs)',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12,
+                    color: Theme.of(context)
+                        .colorScheme
+                        .onSurface
+                        .withAlpha(160))),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _HeaderBlock extends StatelessWidget {
-  final String myName;
-  final String partnerName;
-  final String myGender;
-  final String partnerGender;
-  final String kmText;
-  final int days;
-
-  final bool myIsWinner;
-  final bool pIsWinner;
-
-  final int myStreak;
-  final int partnerStreak;
-
-  final int myTotalWins;
-  final int partnerTotalWins;
-
-  final bool didTieYesterday;
-
-  const _HeaderBlock({
-    required this.myName,
-    required this.partnerName,
-    required this.myGender,
-    required this.partnerGender,
-    required this.kmText,
-    required this.days,
-    required this.myIsWinner,
-    required this.pIsWinner,
-    required this.myStreak,
-    required this.partnerStreak,
-    required this.myTotalWins,
-    required this.partnerTotalWins,
-    required this.didTieYesterday,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _personCard(
-          label: 'Sen',
-          name: myName,
-          gender: myGender,
-          isWinnerToday: myIsWinner,
-          streak: myStreak,
-          totalWins: myTotalWins,
-        ),
-        if (didTieYesterday) ...[
-          const SizedBox(height: 10),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: AppTheme.primary.withAlpha(10),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: AppTheme.primary.withAlpha(35)),
-            ),
-            child: Text(
-              '🤝 Berabere bitti',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  fontWeight: FontWeight.w900,
-                  color: Colors.black.withAlpha(170)),
-            ),
-          ),
-        ],
-        const SizedBox(height: 10),
-        _personCard(
-          label: 'Partner',
-          name: partnerName,
-          gender: partnerGender,
-          isWinnerToday: pIsWinner,
-          streak: partnerStreak,
-          totalWins: partnerTotalWins,
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(child: _pill('Mesafe', '$kmText km')),
-            const SizedBox(width: 10),
-            Expanded(child: _pill('Birlikte', '$days gün')),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _personCard({
-    required String label,
-    required String name,
-    required String gender,
-    required bool isWinnerToday,
-    required int streak,
-    required int totalWins,
-  }) {
-    final showBadge = isWinnerToday;
-    final isFem = gender == 'kadin';
-    final themeColor = isFem ? Colors.pink : Colors.blue;
-    final icon = isFem ? Icons.woman_rounded : Icons.man_rounded;
-
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: themeColor.withAlpha(20),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: themeColor.withAlpha(50)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              CircleAvatar(
-                backgroundColor: themeColor.withAlpha(40),
-                radius: 18,
-                child: Icon(icon, color: themeColor, size: 22),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: RichText(
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  text: TextSpan(
-                    style: TextStyle(
-                      color: themeColor,
-                      fontWeight: FontWeight.w900,
-                      fontSize: 16,
-                    ),
-                    children: [
-                      TextSpan(
-                          text: '$label: ',
-                          style: TextStyle(
-                              color: Colors.black.withAlpha(150),
-                              fontSize: 14)),
-                      TextSpan(text: name.isEmpty ? '---' : name),
-                    ],
-                  ),
-                ),
-              ),
-              if (showBadge) ...[
-                const SizedBox(width: 10),
-                _crownBadge(streak),
-              ],
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Icon(Icons.emoji_events_rounded,
-                  size: 16, color: themeColor.withAlpha(230)),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  'Toplam Kazanma: $totalWins',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontWeight: FontWeight.w900,
-                      color: Colors.black.withAlpha(170)),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _crownBadge(int streak) {
-    final suffix = (streak > 1) ? ' x$streak' : '';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: AppTheme.primary.withAlpha(18),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: AppTheme.primary.withAlpha(60)),
-      ),
-      child: Text(
-        '🏆$suffix',
-        style: TextStyle(
-            fontWeight: FontWeight.w900, color: Colors.black.withAlpha(180)),
-      ),
-    );
-  }
-
-  Widget _pill(String label, String value) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-      decoration: BoxDecoration(
-        color: AppTheme.primary.withAlpha(18),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: AppTheme.primary.withAlpha(35)),
-      ),
-      child: Column(
-        children: [
-          Text(label,
-              style: TextStyle(
-                  color: Colors.black.withAlpha(150),
-                  fontWeight: FontWeight.w900)),
-          const SizedBox(height: 4),
-          Text(value,
-              style:
-                  const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-        ],
       ),
     );
   }
@@ -1729,11 +1633,17 @@ class _FlyingHeart {
   final int id;
   final double x;
   final AnimationController controller;
-  _FlyingHeart({required this.id, required this.x, required this.controller});
+
+  _FlyingHeart({
+    required this.id,
+    required this.x,
+    required this.controller,
+  });
 }
 
 class _FlyingHeartWidget extends StatelessWidget {
   final _FlyingHeart heart;
+
   const _FlyingHeartWidget({required this.heart});
 
   @override
@@ -1744,6 +1654,7 @@ class _FlyingHeartWidget extends StatelessWidget {
         final t = heart.controller.value;
         final top = MediaQuery.of(context).size.height * (0.68 - 0.40 * t);
         final left = MediaQuery.of(context).size.width * heart.x;
+
         return Positioned(
           top: top,
           left: left,
