@@ -18,8 +18,7 @@ class NotificationService {
   static const String workerBaseUrl =
       'https://yms-push.selcuksahin158.workers.dev';
 
-  static const String workerApiKey =
-      'YMS_9f4d2f8a7c91e0b5_yagmur_merve_kaya_selcuk_sahin_secure_key';
+  static const String workerApiKey = 'sizinsecretkeyiniz';
 
   String? _lastRegisteredToken;
   String? _lastRegisteredUid;

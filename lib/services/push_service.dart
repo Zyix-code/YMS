@@ -8,8 +8,7 @@ class PushService {
 
   static const String _base = 'https://yms-push.selcuksahin158.workers.dev';
 
-  static const String _apiKey =
-      'YMS_9f4d2f8a7c91e0b5_yagmur_merve_kaya_selcuk_sahin_secure_key';
+  static const String _apiKey = 'sizinsecretkeyiniz';
   Future<bool> sendToUid({
     required String toUid,
     required String title,
