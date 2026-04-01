@@ -183,7 +183,7 @@ class HomeHeaderCard extends StatelessWidget {
 
   Widget _crownBadge(BuildContext context, int streak) {
     final cs = Theme.of(context).colorScheme;
-    final suffix = streak > 1 ? ' x$streak' : '';
+    final suffix = streak > 0 ? ' x$streak' : '';
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),

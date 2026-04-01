@@ -638,10 +638,21 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
         final myIsWinner = myScore > pScore;
         final pIsWinner = pScore > myScore;
+        final didTie = myScore == pScore;
+
+        final currentMyStreak = _asInt(me['winnerStreak']);
+        final currentPartnerStreak = _asInt(partner['winnerStreak']);
+
+        final nextMyStreak =
+            didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
+
+        final nextPartnerStreak =
+            didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
 
         tx.update(myRef, {
           'lastResultDayKey': currentKey,
           'winnerToday': myIsWinner,
+          'winnerStreak': nextMyStreak,
           'totalWins': myIsWinner
               ? (_asInt(me['totalWins']) + 1)
               : _asInt(me['totalWins']),
@@ -653,6 +664,7 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
         tx.update(partnerRef, {
           'lastResultDayKey': currentKey,
           'winnerToday': pIsWinner,
+          'winnerStreak': nextPartnerStreak,
           'totalWins': pIsWinner
               ? (_asInt(partner['totalWins']) + 1)
               : _asInt(partner['totalWins']),
