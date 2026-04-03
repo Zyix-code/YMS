@@ -24,7 +24,8 @@ class NotificationService {
   String? _lastRegisteredUid;
 
   String? _lastShownKey;
-  int _lastShownAtMs = 0;
+  final Stopwatch _showThrottle = Stopwatch()..start();
+  int _lastShownAtMs = -5000;
 
   bool get hasPermission {
     try {
@@ -133,7 +134,7 @@ class NotificationService {
     if (!hasPermission) return;
 
     final key = '${title.trim()}|${body.trim()}';
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = _showThrottle.elapsedMilliseconds;
 
     if (_lastShownKey == key && (now - _lastShownAtMs) < 2500) {
       return;

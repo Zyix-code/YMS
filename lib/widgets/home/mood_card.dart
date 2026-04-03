@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 
 import '../../theme/app_theme.dart';
+import '../../services/trusted_time_service.dart';
 
 class MoodOption {
   final String key;
@@ -50,9 +51,11 @@ class MoodCard extends StatelessWidget {
   String _timeAgo(Timestamp? ts) {
     if (ts == null) return '';
 
-    final now = DateTime.now();
+    final now = TrustedTimeService.instance.now();
+    if (now == null) return '';
     final dt = ts.toDate();
     final diff = now.difference(dt);
+    if (diff.isNegative) return 'şimdi';
 
     if (diff.inSeconds < 60) return '${diff.inSeconds} sn önce';
     if (diff.inMinutes < 60) return '${diff.inMinutes} dk önce';

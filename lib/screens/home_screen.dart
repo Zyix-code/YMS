@@ -13,10 +13,11 @@ import 'journey_screen.dart';
 import 'pairing_screen.dart';
 
 import '../services/firestore_service.dart';
-import '../services/love_messages.dart';
+import '../services/love_messages_service.dart';
 import '../services/notification_service.dart';
 import '../services/pairing_service.dart';
 import '../services/push_service.dart';
+import '../services/trusted_time_service.dart';
 
 import '../theme/app_theme.dart';
 import '../theme/theme_controller.dart';
@@ -35,6 +36,16 @@ enum LocationUpdateResult {
   permissionDenied,
   timeout,
   error,
+}
+
+class _BlockedSendException implements Exception {
+  final DateTime until;
+  final bool isPenalty;
+
+  const _BlockedSendException({
+    required this.until,
+    required this.isPenalty,
+  });
 }
 
 class HomeScreen extends StatefulWidget {
@@ -88,7 +99,8 @@ class _HomeBody extends StatefulWidget {
   State<_HomeBody> createState() => _HomeBodyState();
 }
 
-class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
+class _HomeBodyState extends State<_HomeBody>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   String? _uid;
   bool _showHistory = false;
   bool _sending = false;
@@ -97,17 +109,19 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   bool _didNavigateToPairing = false;
   bool _heartTapLocked = false;
   bool _messageTapLocked = false;
+  bool _clockTamperInFlight = false;
   String? _error;
 
-  DateTime? _lastSendAt;
   static const int cooldownSeconds = 300;
-  static const String _kLastSendAtMs = 'yms_last_send_at_ms';
   static const String _kLastLocationLat = 'yms_last_location_lat';
   static const String _kLastLocationLng = 'yms_last_location_lng';
+
   static const double _minDistanceMeters = 200;
+  static const Duration _clockDriftTolerance = Duration(minutes: 2);
 
   Timer? _cooldownTicker;
-  int _lastSnackAtMs = 0;
+  final Stopwatch _snackStopwatch = Stopwatch();
+  int _lastSnackAtMs = -5000;
   StreamSubscription<Position>? _positionSub;
   bool _locationStreamStarted = false;
 
@@ -117,6 +131,7 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   final TextEditingController _manual = TextEditingController();
   final Random _rand = Random();
   final List<_FlyingHeart> _hearts = [];
+  int _nextHeartId = 1;
   final ValueNotifier<int> _cooldownNotifier = ValueNotifier<int>(0);
 
   String? _lastSeenDayKey;
@@ -134,18 +149,24 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   Future<void>? _rolloverGate;
   Position? _lastPosition;
 
+  Timestamp? _cooldownUntilTs;
+  Timestamp? _penaltyUntilTs;
+  Timestamp? _suspicionUntilTs;
+
   @override
   void initState() {
     super.initState();
-    _lastSeenDayKey = _todayKeyGlobalUtc();
+    WidgetsBinding.instance.addObserver(this);
+    TrustedTimeService.instance.startSession();
+    _snackStopwatch.start();
     _init();
     _startCooldownTicker();
     _refreshNotifState();
-    _loadLastSendAt();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _cooldownTicker?.cancel();
     _positionSub?.cancel();
     _cooldownNotifier.dispose();
@@ -154,6 +175,22 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
       h.controller.dispose();
     }
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+
+    Future<void>(() async {
+      await _syncTrustedNow(force: true);
+      await _detectLiveClockTamper();
+      final myUid = _uid;
+      final partnerUid = _partnerUidCached;
+      if (myUid != null && partnerUid != null) {
+        await _ensureDailyRollOverIfNeeded(
+            myUid: myUid, partnerUid: partnerUid);
+      }
+    });
   }
 
   Future<void> _init() async {
@@ -169,6 +206,12 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
     if (id == null) return;
 
+    await _syncTrustedNow(force: true);
+    final trustedNow = _trustedNow();
+    if (trustedNow != null) {
+      _lastSeenDayKey = _dayKeyFromTrusted(trustedNow);
+    }
+
     Future<void>(() async {
       await _updateLocationOnce(
         silent: true,
@@ -176,6 +219,205 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
       );
       await _startAutoLocationUpdates();
     });
+  }
+
+  Future<DateTime?> _syncTrustedNow({bool force = false}) async {
+    final trustedNow = await TrustedTimeService.instance.sync(force: force);
+    if (trustedNow == null) return _trustedNow();
+
+    final signal =
+        await TrustedTimeService.instance.persistTrustedSnapshotAndDetectTamper(
+      trustedNow,
+      tolerance: _clockDriftTolerance,
+    );
+    if (signal != null) {
+      await _registerClockTamper(signal: signal, trustedNow: trustedNow);
+    }
+
+    final today = _dayKeyFromTrusted(trustedNow);
+    _lastSeenDayKey ??= today;
+    return trustedNow;
+  }
+
+  DateTime? _trustedNow() => TrustedTimeService.instance.now();
+
+  String _dayKeyFromTrusted(DateTime dt) =>
+      TrustedTimeService.instance.dayKeyTR(dt);
+
+  Future<void> _detectLiveClockTamper() async {
+    final signal = TrustedTimeService.instance.detectLiveClockTamper(
+      tolerance: _clockDriftTolerance,
+    );
+    if (signal == null) return;
+
+    final trustedNow = await TrustedTimeService.instance.nowOrSync(force: true);
+    await _registerClockTamper(signal: signal, trustedNow: trustedNow);
+  }
+
+  Future<void> _registerClockTamper({
+    required TrustedTamperSignal signal,
+    required DateTime trustedNow,
+  }) async {
+    final uid = _uid;
+    if (uid == null || _clockTamperInFlight) return;
+
+    _clockTamperInFlight = true;
+
+    try {
+      final userRef = FirestoreService.instance.users.doc(uid);
+      final suspicionUntil = trustedNow.add(const Duration(minutes: 2));
+
+      final result =
+          await FirestoreService.instance.db.runTransaction((tx) async {
+        final snap = await tx.get(userRef);
+        final data = snap.data() ?? <String, dynamic>{};
+
+        final currentCount = _asInt(data['clockTamperCount']);
+
+        DateTime? existingPenaltyUntil;
+        final existingPenaltyTs = data['penaltyUntil'];
+        if (existingPenaltyTs is Timestamp) {
+          existingPenaltyUntil = existingPenaltyTs.toDate();
+        }
+
+        final lastSignature = _asStr(data['lastClockTamperSignature']);
+        DateTime? lastTamperAt;
+        final lastTamperTs = data['clockTamperedAt'];
+        if (lastTamperTs is Timestamp) {
+          lastTamperAt = lastTamperTs.toDate();
+        }
+
+        final isSameEvent = lastSignature == signal.signature &&
+            lastTamperAt != null &&
+            trustedNow.difference(lastTamperAt).inSeconds < 20;
+
+        if (isSameEvent) {
+          return <String, dynamic>{
+            'count': currentCount,
+            'blockUntil': existingPenaltyUntil,
+            'deduped': true,
+            'suspicionOnly': false,
+          };
+        }
+
+        final lastSuspicionSignature =
+            _asStr(data['clockTamperSuspicionSignature']);
+        DateTime? lastSuspicionAt;
+        final lastSuspicionTs = data['clockTamperSuspicionAt'];
+        if (lastSuspicionTs is Timestamp) {
+          lastSuspicionAt = lastSuspicionTs.toDate();
+        }
+        final previousSuspicionStrong =
+            data['clockTamperSuspicionStrong'] == true;
+
+        final sameSuspicion = lastSuspicionSignature == signal.signature &&
+            lastSuspicionAt != null &&
+            trustedNow.difference(lastSuspicionAt).inSeconds < 90;
+
+        final shouldPenalize =
+            sameSuspicion && (signal.isStrong || previousSuspicionStrong);
+
+        if (!shouldPenalize) {
+          tx.set(
+            userRef,
+            {
+              'clockTamperSuspicionSignature': signal.signature,
+              'clockTamperSuspicionAt': FieldValue.serverTimestamp(),
+              'clockTamperSuspicionUntil': Timestamp.fromDate(suspicionUntil),
+              'clockTamperSuspicionStrong': signal.isStrong,
+              'clockTamperLastObservedReason': signal.reason,
+              'clockTamperLastObservedDeviceDeltaMs': signal.deviceDeltaMs,
+              'clockTamperLastObservedTrustedDeltaMs': signal.trustedDeltaMs,
+            },
+            SetOptions(merge: true),
+          );
+
+          return <String, dynamic>{
+            'count': currentCount,
+            'blockUntil': suspicionUntil,
+            'deduped': false,
+            'suspicionOnly': true,
+          };
+        }
+
+        final nextCount = currentCount + 1;
+        final penaltyDuration =
+            TrustedTimeService.instance.penaltyDurationForViolation(nextCount);
+        final nextPenaltyUntil = trustedNow.add(penaltyDuration);
+
+        final effectivePenaltyUntil = existingPenaltyUntil != null &&
+                existingPenaltyUntil.isAfter(nextPenaltyUntil)
+            ? existingPenaltyUntil
+            : nextPenaltyUntil;
+
+        tx.set(
+          userRef,
+          {
+            'clockTamperCount': nextCount,
+            'clockTamperedAt': FieldValue.serverTimestamp(),
+            'clockTamperReason': signal.reason,
+            'lastClockTamperSignature': signal.signature,
+            'lastClockTamperDeviceDeltaMs': signal.deviceDeltaMs,
+            'lastClockTamperTrustedDeltaMs': signal.trustedDeltaMs,
+            'clockTamperSuspicionSignature': null,
+            'clockTamperSuspicionAt': null,
+            'clockTamperSuspicionUntil': null,
+            'clockTamperSuspicionStrong': null,
+            'penaltyUntil': Timestamp.fromDate(effectivePenaltyUntil),
+            'cooldownUntil': Timestamp.fromDate(effectivePenaltyUntil),
+          },
+          SetOptions(merge: true),
+        );
+
+        return <String, dynamic>{
+          'count': nextCount,
+          'blockUntil': effectivePenaltyUntil,
+          'deduped': false,
+          'suspicionOnly': false,
+        };
+      });
+
+      final count = _asInt(result['count']);
+      final blockUntil = result['blockUntil'] as DateTime?;
+      final deduped = result['deduped'] == true;
+      final suspicionOnly = result['suspicionOnly'] == true;
+
+      if (blockUntil != null) {
+        if (suspicionOnly) {
+          _suspicionUntilTs = Timestamp.fromDate(blockUntil);
+        } else {
+          _penaltyUntilTs = Timestamp.fromDate(blockUntil);
+          _cooldownUntilTs = Timestamp.fromDate(blockUntil);
+          _suspicionUntilTs = null;
+        }
+      }
+
+      if (mounted && !deduped) {
+        if (!suspicionOnly && blockUntil != null) {
+          late final String levelText;
+          if (count <= 1) {
+            levelText = '1. ihlal • 24 saat';
+          } else if (count == 2) {
+            levelText = '2. ihlal • 48 saat';
+          } else {
+            levelText = '3. ihlal+ • 72 saat';
+          }
+
+          setState(() {
+            _error =
+                '⛔ Saat değişikliği tespit edildi. $levelText ceza uygulandı.';
+          });
+        } else if (suspicionOnly) {
+          setState(() {
+            _error =
+                '⏳ Zaman doğrulanıyor. Kısa süre sonra tekrar deneyebilirsin.';
+          });
+        }
+      }
+    } catch (_) {
+    } finally {
+      _clockTamperInFlight = false;
+    }
   }
 
   Future<void> _startAutoLocationUpdates() async {
@@ -242,11 +484,6 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
     });
   }
 
-  String _todayKeyGlobalUtc() {
-    final trTime = DateTime.now().toUtc().add(const Duration(hours: 3));
-    return '${trTime.year}-${trTime.month.toString().padLeft(2, '0')}-${trTime.day.toString().padLeft(2, '0')}';
-  }
-
   String _pairId(String a, String b) {
     final xs = [a, b]..sort();
     return '${xs[0]}_${xs[1]}';
@@ -268,38 +505,6 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
     return s == 'true' || s == '1' || s == 'yes';
   }
 
-  Future<void> _loadLastSendAt() async {
-    try {
-      final sp = await SharedPreferences.getInstance();
-      final ms = sp.getInt(_kLastSendAtMs);
-      if (ms == null || ms <= 0) return;
-
-      final dt = DateTime.fromMillisecondsSinceEpoch(ms);
-      if (DateTime.now().difference(dt).inSeconds > cooldownSeconds + 5) {
-        await sp.remove(_kLastSendAtMs);
-        return;
-      }
-
-      _lastSendAt = dt;
-      _cooldownNotifier.value = _cooldownLeft();
-      if (mounted) setState(() {});
-    } catch (_) {}
-  }
-
-  Future<void> _saveLastSendAt(DateTime dt) async {
-    try {
-      final sp = await SharedPreferences.getInstance();
-      await sp.setInt(_kLastSendAtMs, dt.millisecondsSinceEpoch);
-    } catch (_) {}
-  }
-
-  Future<void> _clearLastSendAt() async {
-    try {
-      final sp = await SharedPreferences.getInstance();
-      await sp.remove(_kLastSendAtMs);
-    } catch (_) {}
-  }
-
   Future<Position?> _loadLastSavedPosition() async {
     try {
       final sp = await SharedPreferences.getInstance();
@@ -309,7 +514,8 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
       return Position(
         latitude: lat,
         longitude: lng,
-        timestamp: DateTime.now(),
+        timestamp: _trustedNow() ??
+            DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
         accuracy: 0,
         altitude: 0,
         altitudeAccuracy: 0,
@@ -347,47 +553,120 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   void _startCooldownTicker() {
     _cooldownTicker?.cancel();
     _cooldownTicker = Timer.periodic(const Duration(seconds: 1), (_) async {
-      if (_lastSendAt == null) return;
+      await _detectLiveClockTamper();
 
       final left = _cooldownLeft();
-
-      if (left <= 0) {
-        _lastSendAt = null;
-        await _clearLastSendAt();
-        _cooldownNotifier.value = 0;
-        if (mounted) setState(() {});
-        return;
+      if (_cooldownNotifier.value != left) {
+        _cooldownNotifier.value = left;
       }
 
-      _cooldownNotifier.value = left;
+      final trustedNow = _trustedNow();
+      final today = trustedNow != null ? _dayKeyFromTrusted(trustedNow) : null;
+      final myUid = _uid;
+      final partnerUid = _partnerUidCached;
+      if (today != null &&
+          myUid != null &&
+          partnerUid != null &&
+          _lastSeenDayKey != today &&
+          !_rolloverRunning) {
+        _lastSeenDayKey = today;
+        _rolloverRunning = true;
+        Future<void>(() async {
+          try {
+            await _ensureDailyRollOverIfNeeded(
+              myUid: myUid,
+              partnerUid: partnerUid,
+            );
+          } finally {
+            _rolloverRunning = false;
+          }
+        });
+      }
     });
   }
 
   bool _isCoolingDown() {
-    if (_lastSendAt == null) return false;
-    return DateTime.now().difference(_lastSendAt!).inSeconds < cooldownSeconds;
+    return _cooldownLeft() > 0;
+  }
+
+  Timestamp? _effectiveBlockUntil() {
+    final candidates = <Timestamp>[
+      if (_cooldownUntilTs != null) _cooldownUntilTs!,
+      if (_penaltyUntilTs != null) _penaltyUntilTs!,
+      if (_suspicionUntilTs != null) _suspicionUntilTs!,
+    ];
+    if (candidates.isEmpty) return null;
+
+    candidates.sort((a, b) => a.toDate().compareTo(b.toDate()));
+    return candidates.last;
   }
 
   int _cooldownLeft() {
-    if (_lastSendAt == null) return 0;
-    final left =
-        cooldownSeconds - DateTime.now().difference(_lastSendAt!).inSeconds;
-    return left < 0 ? 0 : left;
+    final trustedNow = _trustedNow();
+    final blockUntil = _effectiveBlockUntil();
+
+    if (trustedNow == null || blockUntil == null) return 0;
+
+    final diff = blockUntil.toDate().difference(trustedNow).inSeconds;
+    return diff > 0 ? diff : 0;
   }
 
   String _cooldownText() {
+    final trustedNow = _trustedNow();
+    final blockUntil = _effectiveBlockUntil();
     final left = _cooldownLeft();
-    if (left <= 0) return 'Hazır 💗 Gönderebilirsin.';
-    final minutes = left ~/ 60;
+
+    if (blockUntil != null && trustedNow == null) {
+      return 'Bekleme süresi doğrulanıyor…';
+    }
+
+    if (left <= 0) {
+      return 'Hazır 💗 Gönderebilirsin.';
+    }
+
+    final effective = _effectiveBlockUntil();
+    final isPenalty = _penaltyUntilTs != null &&
+        effective != null &&
+        _penaltyUntilTs!.toDate().isAtSameMomentAs(effective.toDate());
+    final isSuspicion = _suspicionUntilTs != null &&
+        effective != null &&
+        _suspicionUntilTs!.toDate().isAtSameMomentAs(effective.toDate());
+
+    final hours = left ~/ 3600;
+    final minutes = (left % 3600) ~/ 60;
     final seconds = left % 60;
+
+    if (hours > 0) {
+      if (isPenalty) {
+        return 'Ceza aktif ⛔ $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+      }
+      if (isSuspicion) {
+        return 'Zaman doğrulanıyor ⏳ $hours sa $minutes dk $seconds sn sonra tekrar deneyebilirsin.';
+      }
+      return 'Minik bir mola 💗 $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+    }
+
     if (minutes > 0) {
+      if (isPenalty) {
+        return 'Ceza aktif ⛔ $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+      }
+      if (isSuspicion) {
+        return 'Zaman doğrulanıyor ⏳ $minutes dk $seconds sn sonra tekrar deneyebilirsin.';
+      }
       return 'Minik bir mola 💗 $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+    }
+
+    if (isPenalty) {
+      return 'Ceza aktif ⛔ $seconds sn sonra tekrar gönderebilirsin.';
+    }
+    if (isSuspicion) {
+      return 'Zaman doğrulanıyor ⏳ $seconds sn sonra tekrar deneyebilirsin.';
     }
     return 'Minik bir mola 💗 $seconds sn sonra tekrar gönderebilirsin.';
   }
 
   void _showCooldownSnack() {
-    final now = DateTime.now().millisecondsSinceEpoch;
+    final now = _snackStopwatch.elapsedMilliseconds;
     if (now - _lastSnackAtMs < 2000) return;
     _lastSnackAtMs = now;
 
@@ -519,10 +798,12 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
   int _daysTogether(Timestamp? pairedAt) {
     if (pairedAt == null) return 0;
+    final trustedNow =
+        _trustedNow() ?? DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
     final start = pairedAt.toDate();
-    final now = DateTime.now();
-    final diff =
-        now.difference(DateTime(start.year, start.month, start.day)).inDays;
+    final diff = trustedNow
+        .difference(DateTime.utc(start.year, start.month, start.day))
+        .inDays;
     return diff < 0 ? 0 : diff + 1;
   }
 
@@ -552,7 +833,8 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   }) {
     if (_unpairing) return;
 
-    final dk = _todayKeyGlobalUtc();
+    final trustedNow = _trustedNow();
+    final dk = trustedNow != null ? _dayKeyFromTrusted(trustedNow) : '';
     final key = '$partnerUid|$dk';
 
     final shouldUpdatePartner =
@@ -582,13 +864,18 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   Future<void> _ensureDailyRollOverIfNeeded({
     required String myUid,
     required String partnerUid,
-  }) {
+  }) async {
     final running = _rolloverGate;
     if (running != null) return running;
 
-    final f =
-        _ensureDailyRollOverIfNeededImpl(myUid: myUid, partnerUid: partnerUid)
-            .whenComplete(() => _rolloverGate = null);
+    final trustedNow = await _syncTrustedNow(force: true);
+    if (trustedNow == null) return;
+
+    final f = _ensureDailyRollOverIfNeededImpl(
+      myUid: myUid,
+      partnerUid: partnerUid,
+      trustedNow: trustedNow,
+    ).whenComplete(() => _rolloverGate = null);
 
     _rolloverGate = f;
     return f;
@@ -604,10 +891,11 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
   Future<void> _ensureDailyRollOverIfNeededImpl({
     required String myUid,
     required String partnerUid,
+    required DateTime trustedNow,
   }) async {
     final users = FirestoreService.instance.users;
     final db = FirestoreService.instance.db;
-    final today = _todayKeyGlobalUtc();
+    final today = _dayKeyFromTrusted(trustedNow);
     final myRef = users.doc(myUid);
     final partnerRef = users.doc(partnerUid);
 
@@ -673,6 +961,8 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
           'dailyMessages': 0,
         });
       });
+
+      _lastSeenDayKey = today;
     } catch (e) {
       if (!_isIgnorableCommitRace(e)) rethrow;
     }
@@ -689,7 +979,7 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
       );
 
       final heart = _FlyingHeart(
-        id: DateTime.now().microsecondsSinceEpoch + i,
+        id: _nextHeartId++,
         x: 0.20 + _rand.nextDouble() * 0.60,
         controller: controller,
       );
@@ -746,7 +1036,6 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
       await _sendInteraction(
         me: me,
-        partner: partner,
         partnerUid: partnerUid,
         type: 'heart',
         message: msg,
@@ -778,7 +1067,6 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
       await _sendInteraction(
         me: me,
-        partner: partner,
         partnerUid: partnerUid,
         type: 'message',
         message: text,
@@ -790,7 +1078,6 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
 
   Future<void> _sendInteraction({
     required Map<String, dynamic> me,
-    required Map<String, dynamic> partner,
     required String partnerUid,
     required String type,
     required String message,
@@ -809,36 +1096,133 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
     });
 
     try {
-      await _ensureDailyRollOverIfNeeded(myUid: myUid, partnerUid: partnerUid);
+      await _detectLiveClockTamper();
+
+      final trustedNow = await _syncTrustedNow(force: true);
+      if (trustedNow == null) {
+        throw Exception('Sunucu saati doğrulanamadı.');
+      }
 
       final users = FirestoreService.instance.users;
-      final batch = FirestoreService.instance.db.batch();
-
-      final dayKey = _todayKeyGlobalUtc();
+      final meRef = users.doc(myUid);
+      final partnerRef = users.doc(partnerUid);
+      final interactions = FirestoreService.instance.interactions;
       final pid = _pairId(myUid, partnerUid);
-      final createdAtMs = DateTime.now().millisecondsSinceEpoch;
+      final today = _dayKeyFromTrusted(trustedNow);
+      final cooldownUntil = Timestamp.fromDate(
+          trustedNow.add(const Duration(seconds: cooldownSeconds)));
 
-      batch.update(users.doc(myUid), {
-        'dailyKey': dayKey,
-        if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
-        if (type == 'message') 'dailyMessages': FieldValue.increment(1),
-        if (type == 'heart') 'totalHearts': FieldValue.increment(1),
-        if (type == 'message') 'totalMessages': FieldValue.increment(1),
+      await FirestoreService.instance.db.runTransaction((tx) async {
+        final mySnap = await tx.get(meRef);
+        final partnerSnap = await tx.get(partnerRef);
+
+        final myData = mySnap.data() ?? <String, dynamic>{};
+        final partnerData = partnerSnap.data() ?? <String, dynamic>{};
+
+        final penaltyTs = myData['penaltyUntil'];
+        if (penaltyTs is Timestamp && penaltyTs.toDate().isAfter(trustedNow)) {
+          throw _BlockedSendException(
+            until: penaltyTs.toDate(),
+            isPenalty: true,
+          );
+        }
+
+        final currentCooldownTs = myData['cooldownUntil'];
+        if (currentCooldownTs is Timestamp &&
+            currentCooldownTs.toDate().isAfter(trustedNow)) {
+          throw _BlockedSendException(
+            until: currentCooldownTs.toDate(),
+            isPenalty: false,
+          );
+        }
+
+        final suspicionTs = myData['clockTamperSuspicionUntil'];
+        if (suspicionTs is Timestamp &&
+            suspicionTs.toDate().isAfter(trustedNow)) {
+          throw _BlockedSendException(
+            until: suspicionTs.toDate(),
+            isPenalty: false,
+          );
+        }
+
+        final currentKey = _asStr(myData['dailyKey']);
+        if (currentKey != today) {
+          if (currentKey.isEmpty) {
+            tx.update(meRef, {
+              'dailyKey': today,
+              'dailyHearts': 0,
+              'dailyMessages': 0,
+            });
+          } else {
+            final myScore =
+                _asInt(myData['dailyHearts']) + _asInt(myData['dailyMessages']);
+            final pScore = _asInt(partnerData['dailyHearts']) +
+                _asInt(partnerData['dailyMessages']);
+
+            final myIsWinner = myScore > pScore;
+            final pIsWinner = pScore > myScore;
+            final didTie = myScore == pScore;
+
+            final currentMyStreak = _asInt(myData['winnerStreak']);
+            final currentPartnerStreak = _asInt(partnerData['winnerStreak']);
+
+            final nextMyStreak =
+                didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
+            final nextPartnerStreak =
+                didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
+
+            tx.update(meRef, {
+              'lastResultDayKey': currentKey,
+              'winnerToday': myIsWinner,
+              'winnerStreak': nextMyStreak,
+              'totalWins': myIsWinner
+                  ? (_asInt(myData['totalWins']) + 1)
+                  : _asInt(myData['totalWins']),
+              'dailyKey': today,
+              'dailyHearts': 0,
+              'dailyMessages': 0,
+            });
+
+            tx.update(partnerRef, {
+              'lastResultDayKey': currentKey,
+              'winnerToday': pIsWinner,
+              'winnerStreak': nextPartnerStreak,
+              'totalWins': pIsWinner
+                  ? (_asInt(partnerData['totalWins']) + 1)
+                  : _asInt(partnerData['totalWins']),
+              'dailyKey': today,
+              'dailyHearts': 0,
+              'dailyMessages': 0,
+            });
+          }
+        }
+
+        tx.update(meRef, {
+          'dailyKey': today,
+          if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
+          if (type == 'message') 'dailyMessages': FieldValue.increment(1),
+          if (type == 'heart') 'totalHearts': FieldValue.increment(1),
+          if (type == 'message') 'totalMessages': FieldValue.increment(1),
+          'cooldownUntil': cooldownUntil,
+          'lastTrustedInteractionAt': Timestamp.fromDate(trustedNow),
+        });
+
+        tx.set(interactions.doc(), {
+          'pairId': pid,
+          'dayKey': today,
+          'createdAtMs': trustedNow.millisecondsSinceEpoch,
+          'type': type,
+          'message': message,
+          'createdAt': FieldValue.serverTimestamp(),
+          'fromUid': myUid,
+          'toUid': partnerUid,
+          'members': [myUid, partnerUid],
+        });
       });
 
-      batch.set(FirestoreService.instance.interactions.doc(), {
-        'pairId': pid,
-        'dayKey': dayKey,
-        'createdAtMs': createdAtMs,
-        'type': type,
-        'message': message,
-        'createdAt': FieldValue.serverTimestamp(),
-        'fromUid': myUid,
-        'toUid': partnerUid,
-        'members': [myUid, partnerUid],
-      });
-
-      await batch.commit();
+      _cooldownUntilTs = cooldownUntil;
+      _cooldownNotifier.value = _cooldownLeft();
+      _lastSeenDayKey = today;
 
       final senderFirst = _asStr(me['firstName']);
       final pushTitle = senderFirst.isEmpty ? 'YMS 💗' : '$senderFirst 💗';
@@ -851,11 +1235,16 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
         body: pushBody,
       );
 
-      _lastSendAt = DateTime.now();
-      _cooldownNotifier.value = _cooldownLeft();
-      await _saveLastSendAt(_lastSendAt!);
-
       _spawnHearts();
+    } on _BlockedSendException catch (e) {
+      final untilTs = Timestamp.fromDate(e.until);
+      if (e.isPenalty) {
+        _penaltyUntilTs = untilTs;
+      } else {
+        _cooldownUntilTs = untilTs;
+      }
+      _cooldownNotifier.value = _cooldownLeft();
+      _showCooldownSnack();
     } catch (e) {
       if (mounted) setState(() => _error = trError(e));
     } finally {
@@ -965,6 +1354,10 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
         'winnerToday': false,
         'dailyKey': '',
         'totalWins': 0,
+        'cooldownUntil': null,
+        'penaltyUntil': null,
+        'clockTamperCount': 0,
+        'clockTamperedAt': null,
       };
 
       final b2 = db.batch();
@@ -999,6 +1392,21 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
     }
   }
 
+  void _applyServerTimingState(Map<String, dynamic> me) {
+    final cooldown = me['cooldownUntil'];
+    final penalty = me['penaltyUntil'];
+    final suspicion = me['clockTamperSuspicionUntil'];
+
+    _cooldownUntilTs = cooldown is Timestamp ? cooldown : null;
+    _penaltyUntilTs = penalty is Timestamp ? penalty : null;
+    _suspicionUntilTs = suspicion is Timestamp ? suspicion : null;
+
+    final left = _cooldownLeft();
+    if (_cooldownNotifier.value != left) {
+      _cooldownNotifier.value = left;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final myUid = _uid;
@@ -1011,12 +1419,25 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: meStream,
       builder: (context, mySnap) {
+        if (mySnap.hasError) {
+          return Scaffold(
+            body: Center(
+              child: Text(
+                'Kullanıcı verisi okunamadı:\n${mySnap.error}',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+
         if (!mySnap.hasData) {
           return const Scaffold(
               body: Center(child: CircularProgressIndicator()));
         }
 
         final me = mySnap.data!.data() ?? {};
+        _applyServerTimingState(me);
+
         final partnerUid = _asStr(me['pairedUserId']);
 
         if (me['isPaired'] != true || partnerUid.isEmpty) {
@@ -1049,6 +1470,17 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: partnerStream,
           builder: (context, pSnap) {
+            if (pSnap.hasError) {
+              return Scaffold(
+                body: Center(
+                  child: Text(
+                    'Partner verisi okunamadı:\n${pSnap.error}',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              );
+            }
+
             if (!pSnap.hasData) {
               return const Scaffold(
                   body: Center(child: CircularProgressIndicator()));
@@ -1093,8 +1525,12 @@ class _HomeBodyState extends State<_HomeBody> with TickerProviderStateMixin {
               });
             }
 
-            final dkNow = _todayKeyGlobalUtc();
-            if (_lastSeenDayKey != dkNow && !_rolloverRunning) {
+            final trustedNow = _trustedNow();
+            final dkNow =
+                trustedNow != null ? _dayKeyFromTrusted(trustedNow) : null;
+            if (dkNow != null &&
+                _lastSeenDayKey != dkNow &&
+                !_rolloverRunning) {
               _lastSeenDayKey = dkNow;
               _rolloverRunning = true;
               WidgetsBinding.instance.addPostFrameCallback((_) async {

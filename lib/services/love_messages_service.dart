@@ -1,6 +1,8 @@
 import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'trusted_time_service.dart';
+
 class LoveMessages {
   static final _rand = Random.secure();
 
@@ -182,8 +184,7 @@ class LoveMessages {
     "😊",
     "😌",
   ];
-  static List<String> _filteredCores() {
-    final hour = DateTime.now().hour;
+  static List<String> _filteredCores(int hour) {
 
     if (hour >= 5 && hour < 11) {
       return _cores
@@ -220,7 +221,8 @@ class LoveMessages {
 
   static Future<String> randomFor(String name) async {
     final prefs = await SharedPreferences.getInstance();
-    final today = DateTime.now().toIso8601String().substring(0, 10);
+    final now = await TrustedTimeService.instance.nowOrSync();
+    final today = TrustedTimeService.instance.dayKeyTR(now);
 
     final lastDate = prefs.getString(_dateKey);
 
@@ -230,7 +232,7 @@ class LoveMessages {
     }
 
     final used = prefs.getStringList(_usedKey) ?? [];
-    final cores = _filteredCores();
+    final cores = _filteredCores(TrustedTimeService.instance.hourTR(now));
 
     late int o, c, cl, e;
     String key;

@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import '../theme/app_theme.dart';
@@ -28,20 +29,29 @@ class _IntroScreenState extends State<IntroScreen>
       duration: const Duration(seconds: 10),
     )..repeat();
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
       _hearts.add(_IntroHeart(
         x: _rand.nextDouble(),
-        size: 14 + _rand.nextDouble() * 18,
-        speed: 0.05 + _rand.nextDouble() * 0.08,
+        size: 14 + _rand.nextDouble() * 20,
+        speed: 0.05 + _rand.nextDouble() * 0.1,
         phase: _rand.nextDouble(),
       ));
     }
 
-    Future.delayed(const Duration(milliseconds: 2800), () {
+    Future.delayed(const Duration(milliseconds: 3000), () {
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const SplashDecider()),
+        PageRouteBuilder(
+          transitionDuration: const Duration(milliseconds: 800),
+          pageBuilder: (_, __, ___) => const SplashDecider(),
+          transitionsBuilder: (_, animation, __, child) {
+            return FadeTransition(
+              opacity: animation,
+              child: child,
+            );
+          },
+        ),
       );
     });
   }
@@ -53,6 +63,7 @@ class _IntroScreenState extends State<IntroScreen>
   }
 
   Future<void> _launch(String url) async {
+    HapticFeedback.lightImpact();
     final uri = Uri.parse(url);
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       throw Exception('Açılamadı: $url');
@@ -69,126 +80,165 @@ class _IntroScreenState extends State<IntroScreen>
         builder: (_, __) {
           return Stack(
             children: [
+              /// 🌈 PREMIUM GRADIENT
               Container(
-                decoration: BoxDecoration(
+                decoration: const BoxDecoration(
                   gradient: LinearGradient(
-                    colors: Theme.of(context).brightness == Brightness.dark
-                        ? const [
-                            Color(0xFF15151C),
-                            Color(0xFF1E1E29),
-                            Color(0xFF2A2030),
-                          ]
-                        : const [
-                            Color(0xFFEDEFF6),
-                            Color(0xFFDDE3F0),
-                            Color(0xFFC9D2E8),
-                          ],
+                    colors: [
+                      Color(0xFF1A1A2E),
+                      Color(0xFF16213E),
+                      Color(0xFF0F3460),
+                      Color(0xFFE94560),
+                    ],
+                    stops: [0.0, 0.4, 0.75, 1.0],
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                   ),
                 ),
               ),
+
+              /// 💖 FLOATING HEARTS
               ..._hearts.map((h) {
                 final t = (_c.value + h.phase) % 1.0;
+
+                final y = size.height * (1.1 - t);
+                final x = size.width * (h.x + sin(t * 2 * pi) * 0.04);
+
+                final opacity = (sin(t * pi)).clamp(0.2, 1.0);
+                final scale = 0.8 + (sin(t * pi) * 0.4);
+
                 return Positioned(
-                  top: size.height * (1.1 - t),
-                  left: size.width * h.x,
+                  top: y,
+                  left: x,
                   child: Opacity(
-                    opacity: 0.4,
-                    child: Icon(
-                      Icons.favorite,
-                      size: h.size,
-                      color: AppTheme.primary,
+                    opacity: opacity,
+                    child: Transform.scale(
+                      scale: scale,
+                      child: Icon(
+                        Icons.favorite,
+                        size: h.size,
+                        color: AppTheme.primary.withOpacity(0.8),
+                      ),
                     ),
                   ),
                 );
               }),
+
+              /// 💎 GLASS CARD
               Center(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 28),
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(28),
+                    borderRadius: BorderRadius.circular(30),
                     child: BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+                      filter: ImageFilter.blur(sigmaX: 25, sigmaY: 25),
                       child: Container(
                         padding: const EdgeInsets.all(28),
                         decoration: BoxDecoration(
-                          color: Theme.of(context).brightness == Brightness.dark
-                              ? Colors.white.withOpacity(0.08)
-                              : Colors.white.withOpacity(0.6),
-                          borderRadius: BorderRadius.circular(28),
+                          color: Colors.white.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(30),
                           border: Border.all(
-                            color: Theme.of(context).dividerColor.withAlpha(80),
+                            color: Colors.white.withOpacity(0.2),
                           ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.3),
+                              blurRadius: 40,
+                              offset: const Offset(0, 15),
+                            ),
+                          ],
                         ),
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Icon(
-                              Icons.favorite_rounded,
-                              size: 60,
-                              color: AppTheme.primary,
-                            ),
-                            const SizedBox(height: 18),
-                            Text(
-                              'YMS',
-                              style: TextStyle(
-                                fontSize: 36,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: 3,
-                                color: Theme.of(context).colorScheme.onSurface,
+                            /// ❤️ HEARTBEAT LOGO
+                            Transform.scale(
+                              scale: 1 + (sin(_c.value * 2 * pi) * 0.08),
+                              child: const Icon(
+                                Icons.favorite_rounded,
+                                size: 64,
+                                color: AppTheme.primary,
                               ),
                             ),
+
                             const SizedBox(height: 20),
+
+                            /// 🔤 TITLE
+                            const Text(
+                              'YMS',
+                              style: TextStyle(
+                                fontSize: 40,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 4,
+                                color: Colors.white,
+                              ),
+                            ),
+
+                            const SizedBox(height: 22),
+
+                            /// 📝 DESCRIPTION
                             Text(
                               'Bu uygulamanın asıl amacı kız arkadaşım için yapılmış olup,\n'
-                              'gün içinde birbirimize küçük hatırlatmalar göndermemizi sağlamaktır.',
+                              'gün içinde birbirimize küçük hatırlatmalar göndermemizi sağlar.',
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 fontSize: 15.5,
                                 fontStyle: FontStyle.italic,
-                                height: 1.6,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurface
-                                    .withAlpha(210),
+                                height: 1.8,
+                                color: Colors.white.withOpacity(0.85),
                               ),
                             ),
-                            const SizedBox(height: 30),
-                            const Divider(),
-                            const SizedBox(height: 12),
+
+                            const SizedBox(height: 28),
+
+                            /// ✨ DIVIDER
+                            Container(
+                              height: 1,
+                              width: 120,
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  colors: [
+                                    Colors.transparent,
+                                    Colors.white.withOpacity(0.8),
+                                    Colors.transparent,
+                                  ],
+                                ),
+                              ),
+                            ),
+
+                            const SizedBox(height: 16),
+
+                            /// 👨‍💻 INFO
                             Text(
-                              'Bu program SELÇUK ŞAHİN tarafından geliştirilmiştir.\n'
-                              'Herhangi bir arıza, öneri, şikayet için\n'
-                              'selcuksahin158@gmail.com adresine mail gönderebilirsiniz.',
+                              'SELÇUK ŞAHİN tarafından geliştirilmiştir.\n'
+                              'Öneri & destek için mail atabilirsiniz.',
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 fontSize: 13.5,
                                 fontWeight: FontWeight.w500,
                                 height: 1.6,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurface
-                                    .withAlpha(190),
+                                color: Colors.white.withOpacity(0.7),
                               ),
                             ),
-                            const SizedBox(height: 18),
+
+                            const SizedBox(height: 20),
+
+                            /// 🔗 SOCIAL ICONS
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 IconButton(
                                   icon: const FaIcon(
                                     FontAwesomeIcons.instagram,
-                                    color: Colors.pink,
+                                    color: Colors.pinkAccent,
                                   ),
                                   onPressed: () => _launch(
                                       'https://instagram.com/selcukshn74'),
                                 ),
                                 IconButton(
-                                  icon: FaIcon(
+                                  icon: const FaIcon(
                                     FontAwesomeIcons.github,
-                                    color:
-                                        Theme.of(context).colorScheme.onSurface,
+                                    color: Colors.white,
                                   ),
                                   onPressed: () =>
                                       _launch('https://github.com/Zyix-code'),

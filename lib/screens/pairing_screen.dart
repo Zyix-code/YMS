@@ -123,7 +123,13 @@ class _PairingScreenState extends State<PairingScreen> {
 
       await batch.commit();
     } catch (e) {
-      _safeSetState(() => _error = trError(e));
+      final s = e.toString().toLowerCase();
+      if (s.contains('permission-denied')) {
+        _safeSetState(() => _error =
+            'İzin hatası 😅\nPartner zaten eşleşmiş olabilir ya da partnerın kaydı yok.');
+      } else {
+        _safeSetState(() => _error = trError(e));
+      }
     } finally {
       _safeSetState(() => _loading = false);
     }
