@@ -19,13 +19,17 @@ import '../services/pairing_service.dart';
 import '../services/push_service.dart';
 import '../services/trusted_time_service.dart';
 
-import '../theme/app_theme.dart';
 import '../theme/theme_controller.dart';
 
 import '../utils/app_error.dart';
 
 import '../widgets/home/chat_history_widget.dart';
+import '../widgets/home/flying_hearts_overlay.dart';
+import '../widgets/home/home_action_menu_button.dart';
+import '../widgets/home/home_compose_card.dart';
 import '../widgets/home/home_header_card.dart';
+import '../widgets/home/home_heart_button.dart';
+import '../widgets/home/home_stats_card.dart';
 import '../widgets/home/last_message_widget.dart';
 import '../widgets/home/mood_card.dart';
 
@@ -110,6 +114,7 @@ class _HomeBodyState extends State<_HomeBody>
   bool _heartTapLocked = false;
   bool _messageTapLocked = false;
   bool _clockTamperInFlight = false;
+  bool _cooldownTickInFlight = false;
   String? _error;
 
   static const int cooldownSeconds = 300;
@@ -130,9 +135,11 @@ class _HomeBodyState extends State<_HomeBody>
 
   final TextEditingController _manual = TextEditingController();
   final Random _rand = Random();
-  final List<_FlyingHeart> _hearts = [];
+  final List<HomeFlyingHeart> _hearts = [];
   int _nextHeartId = 1;
   final ValueNotifier<int> _cooldownNotifier = ValueNotifier<int>(0);
+  final ValueNotifier<DateTime> _trustedNowNotifier = ValueNotifier<DateTime>(
+      DateTime.fromMillisecondsSinceEpoch(0, isUtc: true));
 
   String? _lastSeenDayKey;
   bool _rolloverRunning = false;
@@ -151,7 +158,6 @@ class _HomeBodyState extends State<_HomeBody>
 
   Timestamp? _cooldownUntilTs;
   Timestamp? _penaltyUntilTs;
-  Timestamp? _suspicionUntilTs;
 
   @override
   void initState() {
@@ -170,6 +176,7 @@ class _HomeBodyState extends State<_HomeBody>
     _cooldownTicker?.cancel();
     _positionSub?.cancel();
     _cooldownNotifier.dispose();
+    _trustedNowNotifier.dispose();
     _manual.dispose();
     for (final h in _hearts) {
       h.controller.dispose();
@@ -206,6 +213,7 @@ class _HomeBodyState extends State<_HomeBody>
 
     if (id == null) return;
 
+    await TrustedTimeService.instance.bootstrap();
     await _syncTrustedNow(force: true);
     final trustedNow = _trustedNow();
     if (trustedNow != null) {
@@ -235,6 +243,9 @@ class _HomeBodyState extends State<_HomeBody>
     }
 
     final today = _dayKeyFromTrusted(trustedNow);
+    if (_trustedNowNotifier.value != trustedNow) {
+      _trustedNowNotifier.value = trustedNow;
+    }
     _lastSeenDayKey ??= today;
     return trustedNow;
   }
@@ -265,93 +276,64 @@ class _HomeBodyState extends State<_HomeBody>
 
     try {
       final userRef = FirestoreService.instance.users.doc(uid);
-      final suspicionUntil = trustedNow.add(const Duration(minutes: 2));
+      final snap = await userRef.get();
+      final data = snap.data() ?? <String, dynamic>{};
 
-      final result =
-          await FirestoreService.instance.db.runTransaction((tx) async {
-        final snap = await tx.get(userRef);
-        final data = snap.data() ?? <String, dynamic>{};
+      final currentCount = _asInt(data['clockTamperCount']);
 
-        final currentCount = _asInt(data['clockTamperCount']);
+      DateTime? existingPenaltyUntil;
+      final existingPenaltyTs = data['penaltyUntil'];
+      if (existingPenaltyTs is Timestamp) {
+        existingPenaltyUntil = existingPenaltyTs.toDate();
+      }
 
-        DateTime? existingPenaltyUntil;
-        final existingPenaltyTs = data['penaltyUntil'];
-        if (existingPenaltyTs is Timestamp) {
-          existingPenaltyUntil = existingPenaltyTs.toDate();
-        }
+      final lastSignature = _asStr(data['lastClockTamperSignature']);
+      DateTime? lastTamperAt;
+      final lastTamperTs = data['clockTamperedAt'];
+      if (lastTamperTs is Timestamp) {
+        lastTamperAt = lastTamperTs.toDate();
+      }
 
-        final lastSignature = _asStr(data['lastClockTamperSignature']);
-        DateTime? lastTamperAt;
-        final lastTamperTs = data['clockTamperedAt'];
-        if (lastTamperTs is Timestamp) {
-          lastTamperAt = lastTamperTs.toDate();
-        }
+      final isSameEvent = lastSignature == signal.signature &&
+          lastTamperAt != null &&
+          trustedNow.difference(lastTamperAt).inSeconds < 20;
 
-        final isSameEvent = lastSignature == signal.signature &&
-            lastTamperAt != null &&
-            trustedNow.difference(lastTamperAt).inSeconds < 20;
+      Map<String, dynamic> result;
 
-        if (isSameEvent) {
-          return <String, dynamic>{
-            'count': currentCount,
-            'blockUntil': existingPenaltyUntil,
-            'deduped': true,
-            'suspicionOnly': false,
-          };
-        }
+      if (isSameEvent) {
+        result = <String, dynamic>{
+          'count': currentCount,
+          'penaltyUntil': existingPenaltyUntil,
+          'deduped': true,
+          'penalized': false,
+        };
+      } else if (!signal.isStrong) {
+        await userRef.set(
+          {
+            'clockTamperLastObservedReason': signal.reason,
+            'clockTamperLastObservedDeviceDeltaMs': signal.deviceDeltaMs,
+            'clockTamperLastObservedTrustedDeltaMs': signal.trustedDeltaMs,
+          },
+          SetOptions(merge: true),
+        );
 
-        final lastSuspicionSignature =
-            _asStr(data['clockTamperSuspicionSignature']);
-        DateTime? lastSuspicionAt;
-        final lastSuspicionTs = data['clockTamperSuspicionAt'];
-        if (lastSuspicionTs is Timestamp) {
-          lastSuspicionAt = lastSuspicionTs.toDate();
-        }
-        final previousSuspicionStrong =
-            data['clockTamperSuspicionStrong'] == true;
-
-        final sameSuspicion = lastSuspicionSignature == signal.signature &&
-            lastSuspicionAt != null &&
-            trustedNow.difference(lastSuspicionAt).inSeconds < 90;
-
-        final shouldPenalize =
-            sameSuspicion && (signal.isStrong || previousSuspicionStrong);
-
-        if (!shouldPenalize) {
-          tx.set(
-            userRef,
-            {
-              'clockTamperSuspicionSignature': signal.signature,
-              'clockTamperSuspicionAt': FieldValue.serverTimestamp(),
-              'clockTamperSuspicionUntil': Timestamp.fromDate(suspicionUntil),
-              'clockTamperSuspicionStrong': signal.isStrong,
-              'clockTamperLastObservedReason': signal.reason,
-              'clockTamperLastObservedDeviceDeltaMs': signal.deviceDeltaMs,
-              'clockTamperLastObservedTrustedDeltaMs': signal.trustedDeltaMs,
-            },
-            SetOptions(merge: true),
-          );
-
-          return <String, dynamic>{
-            'count': currentCount,
-            'blockUntil': suspicionUntil,
-            'deduped': false,
-            'suspicionOnly': true,
-          };
-        }
-
+        result = <String, dynamic>{
+          'count': currentCount,
+          'penaltyUntil': existingPenaltyUntil,
+          'deduped': false,
+          'penalized': false,
+        };
+      } else {
         final nextCount = currentCount + 1;
         final penaltyDuration =
             TrustedTimeService.instance.penaltyDurationForViolation(nextCount);
-        final nextPenaltyUntil = trustedNow.add(penaltyDuration);
-
-        final effectivePenaltyUntil = existingPenaltyUntil != null &&
-                existingPenaltyUntil.isAfter(nextPenaltyUntil)
+        final penaltyBase = existingPenaltyUntil != null &&
+                existingPenaltyUntil.isAfter(trustedNow)
             ? existingPenaltyUntil
-            : nextPenaltyUntil;
+            : trustedNow;
+        final nextPenaltyUntil = penaltyBase.add(penaltyDuration);
 
-        tx.set(
-          userRef,
+        await userRef.set(
           {
             'clockTamperCount': nextCount,
             'clockTamperedAt': FieldValue.serverTimestamp(),
@@ -359,60 +341,43 @@ class _HomeBodyState extends State<_HomeBody>
             'lastClockTamperSignature': signal.signature,
             'lastClockTamperDeviceDeltaMs': signal.deviceDeltaMs,
             'lastClockTamperTrustedDeltaMs': signal.trustedDeltaMs,
-            'clockTamperSuspicionSignature': null,
-            'clockTamperSuspicionAt': null,
-            'clockTamperSuspicionUntil': null,
-            'clockTamperSuspicionStrong': null,
-            'penaltyUntil': Timestamp.fromDate(effectivePenaltyUntil),
-            'cooldownUntil': Timestamp.fromDate(effectivePenaltyUntil),
+            'penaltyUntil': Timestamp.fromDate(nextPenaltyUntil),
+            'cooldownUntil': Timestamp.fromDate(nextPenaltyUntil),
           },
           SetOptions(merge: true),
         );
 
-        return <String, dynamic>{
+        result = <String, dynamic>{
           'count': nextCount,
-          'blockUntil': effectivePenaltyUntil,
+          'penaltyUntil': nextPenaltyUntil,
           'deduped': false,
-          'suspicionOnly': false,
+          'penalized': true,
         };
-      });
-
-      final count = _asInt(result['count']);
-      final blockUntil = result['blockUntil'] as DateTime?;
-      final deduped = result['deduped'] == true;
-      final suspicionOnly = result['suspicionOnly'] == true;
-
-      if (blockUntil != null) {
-        if (suspicionOnly) {
-          _suspicionUntilTs = Timestamp.fromDate(blockUntil);
-        } else {
-          _penaltyUntilTs = Timestamp.fromDate(blockUntil);
-          _cooldownUntilTs = Timestamp.fromDate(blockUntil);
-          _suspicionUntilTs = null;
-        }
       }
 
-      if (mounted && !deduped) {
-        if (!suspicionOnly && blockUntil != null) {
-          late final String levelText;
-          if (count <= 1) {
-            levelText = '1. ihlal • 24 saat';
-          } else if (count == 2) {
-            levelText = '2. ihlal • 48 saat';
-          } else {
-            levelText = '3. ihlal+ • 72 saat';
-          }
+      final count = _asInt(result['count']);
+      final penaltyUntil = result['penaltyUntil'] as DateTime?;
+      final deduped = result['deduped'] == true;
+      final penalized = result['penalized'] == true;
 
-          setState(() {
-            _error =
-                '⛔ Saat değişikliği tespit edildi. $levelText ceza uygulandı.';
-          });
-        } else if (suspicionOnly) {
-          setState(() {
-            _error =
-                '⏳ Zaman doğrulanıyor. Kısa süre sonra tekrar deneyebilirsin.';
-          });
+      if (penaltyUntil != null && penalized) {
+        _penaltyUntilTs = Timestamp.fromDate(penaltyUntil);
+        _cooldownUntilTs = Timestamp.fromDate(penaltyUntil);
+      }
+
+      if (penaltyUntil != null && penalized && !deduped) {
+        late final String levelText;
+        if (count <= 1) {
+          levelText = '1. ihlal • 24 saat';
+        } else if (count == 2) {
+          levelText = '2. ihlal • 48 saat';
+        } else {
+          levelText = '3. ihlal+ • 72 saat';
         }
+
+        _setErrorIfChanged(
+          '⛔ Saat değişikliği tespit edildi. $levelText ceza uygulandı.',
+        );
       }
     } catch (_) {
     } finally {
@@ -505,6 +470,24 @@ class _HomeBodyState extends State<_HomeBody>
     return s == 'true' || s == '1' || s == 'yes';
   }
 
+  void _setErrorIfChanged(String? next) {
+    if (!mounted || _error == next) return;
+    setState(() => _error = next);
+  }
+
+  Future<DateTime?> _getFreshTrustedNow({bool force = false}) async {
+    final cached = _trustedNow();
+    if (cached != null && !force) return cached;
+
+    final synced = await _syncTrustedNow(force: force);
+    if (synced != null) return synced;
+
+    if (!force) {
+      return _syncTrustedNow(force: true);
+    }
+    return _trustedNow();
+  }
+
   Future<Position?> _loadLastSavedPosition() async {
     try {
       final sp = await SharedPreferences.getInstance();
@@ -545,42 +528,54 @@ class _HomeBodyState extends State<_HomeBody>
       'lastLocation': {
         'lat': pos.latitude,
         'lng': pos.longitude,
-        'at': FieldValue.serverTimestamp(),
       },
+      'lastLocationAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   }
 
   void _startCooldownTicker() {
     _cooldownTicker?.cancel();
     _cooldownTicker = Timer.periodic(const Duration(seconds: 1), (_) async {
-      await _detectLiveClockTamper();
+      if (_cooldownTickInFlight) return;
+      _cooldownTickInFlight = true;
 
-      final left = _cooldownLeft();
-      if (_cooldownNotifier.value != left) {
-        _cooldownNotifier.value = left;
-      }
+      try {
+        await _detectLiveClockTamper();
 
-      final trustedNow = _trustedNow();
-      final today = trustedNow != null ? _dayKeyFromTrusted(trustedNow) : null;
-      final myUid = _uid;
-      final partnerUid = _partnerUidCached;
-      if (today != null &&
-          myUid != null &&
-          partnerUid != null &&
-          _lastSeenDayKey != today &&
-          !_rolloverRunning) {
-        _lastSeenDayKey = today;
-        _rolloverRunning = true;
-        Future<void>(() async {
-          try {
-            await _ensureDailyRollOverIfNeeded(
-              myUid: myUid,
-              partnerUid: partnerUid,
-            );
-          } finally {
-            _rolloverRunning = false;
-          }
-        });
+        final trustedNow = _trustedNow();
+        if (trustedNow != null && _trustedNowNotifier.value != trustedNow) {
+          _trustedNowNotifier.value = trustedNow;
+        }
+
+        final left = _cooldownLeft();
+        if (_cooldownNotifier.value != left) {
+          _cooldownNotifier.value = left;
+        }
+
+        final today =
+            trustedNow != null ? _dayKeyFromTrusted(trustedNow) : null;
+        final myUid = _uid;
+        final partnerUid = _partnerUidCached;
+        if (today != null &&
+            myUid != null &&
+            partnerUid != null &&
+            _lastSeenDayKey != today &&
+            !_rolloverRunning) {
+          _lastSeenDayKey = today;
+          _rolloverRunning = true;
+          Future<void>(() async {
+            try {
+              await _ensureDailyRollOverIfNeeded(
+                myUid: myUid,
+                partnerUid: partnerUid,
+              );
+            } finally {
+              _rolloverRunning = false;
+            }
+          });
+        }
+      } finally {
+        _cooldownTickInFlight = false;
       }
     });
   }
@@ -590,15 +585,13 @@ class _HomeBodyState extends State<_HomeBody>
   }
 
   Timestamp? _effectiveBlockUntil() {
-    final candidates = <Timestamp>[
-      if (_cooldownUntilTs != null) _cooldownUntilTs!,
-      if (_penaltyUntilTs != null) _penaltyUntilTs!,
-      if (_suspicionUntilTs != null) _suspicionUntilTs!,
-    ];
-    if (candidates.isEmpty) return null;
+    final cooldown = _cooldownUntilTs;
+    final penalty = _penaltyUntilTs;
 
-    candidates.sort((a, b) => a.toDate().compareTo(b.toDate()));
-    return candidates.last;
+    if (cooldown == null) return penalty;
+    if (penalty == null) return cooldown;
+
+    return cooldown.toDate().isAfter(penalty.toDate()) ? cooldown : penalty;
   }
 
   int _cooldownLeft() {
@@ -614,11 +607,11 @@ class _HomeBodyState extends State<_HomeBody>
   String _cooldownText() {
     final trustedNow = _trustedNow();
     final blockUntil = _effectiveBlockUntil();
-    final left = _cooldownLeft();
-
     if (blockUntil != null && trustedNow == null) {
-      return 'Bekleme süresi doğrulanıyor…';
+      return 'Süre hesaplanıyor…';
     }
+
+    final left = _cooldownLeft();
 
     if (left <= 0) {
       return 'Hazır 💗 Gönderebilirsin.';
@@ -628,41 +621,26 @@ class _HomeBodyState extends State<_HomeBody>
     final isPenalty = _penaltyUntilTs != null &&
         effective != null &&
         _penaltyUntilTs!.toDate().isAtSameMomentAs(effective.toDate());
-    final isSuspicion = _suspicionUntilTs != null &&
-        effective != null &&
-        _suspicionUntilTs!.toDate().isAtSameMomentAs(effective.toDate());
 
     final hours = left ~/ 3600;
     final minutes = (left % 3600) ~/ 60;
     final seconds = left % 60;
 
     if (hours > 0) {
-      if (isPenalty) {
-        return 'Ceza aktif ⛔ $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
-      }
-      if (isSuspicion) {
-        return 'Zaman doğrulanıyor ⏳ $hours sa $minutes dk $seconds sn sonra tekrar deneyebilirsin.';
-      }
-      return 'Minik bir mola 💗 $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+      return isPenalty
+          ? 'Ceza aktif ⛔ $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.'
+          : 'Minik bir mola 💗 $hours sa $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
     }
 
     if (minutes > 0) {
-      if (isPenalty) {
-        return 'Ceza aktif ⛔ $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
-      }
-      if (isSuspicion) {
-        return 'Zaman doğrulanıyor ⏳ $minutes dk $seconds sn sonra tekrar deneyebilirsin.';
-      }
-      return 'Minik bir mola 💗 $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
+      return isPenalty
+          ? 'Ceza aktif ⛔ $minutes dk $seconds sn sonra tekrar gönderebilirsin.'
+          : 'Minik bir mola 💗 $minutes dk $seconds sn sonra tekrar gönderebilirsin.';
     }
 
-    if (isPenalty) {
-      return 'Ceza aktif ⛔ $seconds sn sonra tekrar gönderebilirsin.';
-    }
-    if (isSuspicion) {
-      return 'Zaman doğrulanıyor ⏳ $seconds sn sonra tekrar deneyebilirsin.';
-    }
-    return 'Minik bir mola 💗 $seconds sn sonra tekrar gönderebilirsin.';
+    return isPenalty
+        ? 'Ceza aktif ⛔ $seconds sn sonra tekrar gönderebilirsin.'
+        : 'Minik bir mola 💗 $seconds sn sonra tekrar gönderebilirsin.';
   }
 
   void _showCooldownSnack() {
@@ -695,7 +673,7 @@ class _HomeBodyState extends State<_HomeBody>
 
     try {
       if (mounted) {
-        setState(() => _error = null);
+        _setErrorIfChanged(null);
       }
 
       final enabled = await Geolocator.isLocationServiceEnabled();
@@ -714,10 +692,9 @@ class _HomeBodyState extends State<_HomeBody>
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) {
         if (!silent && mounted) {
-          setState(() {
-            _error =
-                '🙈 Konum izni yok. İzin verirsen mesafeyi gösterebilirim.';
-          });
+          _setErrorIfChanged(
+            '🙈 Konum izni yok. İzin verirsen mesafeyi gösterebilirim.',
+          );
         }
         return LocationUpdateResult.permissionDenied;
       }
@@ -746,7 +723,7 @@ class _HomeBodyState extends State<_HomeBody>
             _hasSyncedInitialLocation = true;
 
             if (mounted) {
-              setState(() => _error = null);
+              _setErrorIfChanged(null);
             }
 
             return LocationUpdateResult.updated;
@@ -762,20 +739,18 @@ class _HomeBodyState extends State<_HomeBody>
       _hasSyncedInitialLocation = true;
 
       if (mounted) {
-        setState(() => _error = null);
+        _setErrorIfChanged(null);
       }
 
       return LocationUpdateResult.updated;
     } on TimeoutException {
       if (!silent && mounted) {
-        setState(() {
-          _error = '⏳ Konum alınamadı. Birazdan tekrar dener misin?';
-        });
+        _setErrorIfChanged('⏳ Konum alınamadı. Birazdan tekrar dener misin?');
       }
       return LocationUpdateResult.timeout;
     } catch (e) {
       if (!silent && mounted) {
-        setState(() => _error = trError(e));
+        _setErrorIfChanged(trError(e));
       }
       return LocationUpdateResult.error;
     }
@@ -868,7 +843,7 @@ class _HomeBodyState extends State<_HomeBody>
     final running = _rolloverGate;
     if (running != null) return running;
 
-    final trustedNow = await _syncTrustedNow(force: true);
+    final trustedNow = await _getFreshTrustedNow();
     if (trustedNow == null) return;
 
     final f = _ensureDailyRollOverIfNeededImpl(
@@ -888,6 +863,13 @@ class _HomeBodyState extends State<_HomeBody>
         s.contains('already-exists');
   }
 
+  void _queueSafeRefresh() {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
   Future<void> _ensureDailyRollOverIfNeededImpl({
     required String myUid,
     required String partnerUid,
@@ -900,44 +882,53 @@ class _HomeBodyState extends State<_HomeBody>
     final partnerRef = users.doc(partnerUid);
 
     try {
-      await db.runTransaction((tx) async {
-        final mySnap = await tx.get(myRef);
-        final partnerSnap = await tx.get(partnerRef);
+      final mySnap = await myRef.get();
+      final partnerSnap = await partnerRef.get();
 
-        final me = mySnap.data() ?? <String, dynamic>{};
-        final partner = partnerSnap.data() ?? <String, dynamic>{};
+      final me = mySnap.data() ?? <String, dynamic>{};
+      final partner = partnerSnap.data() ?? <String, dynamic>{};
 
-        final currentKey = _asStr(me['dailyKey']);
+      final currentKey = _asStr(me['dailyKey']);
+      if (currentKey == today) {
+        _lastSeenDayKey = today;
+        return;
+      }
 
-        if (currentKey == today) return;
+      final batch = db.batch();
 
-        if (currentKey.isEmpty) {
-          tx.update(myRef, {
+      if (currentKey.isEmpty) {
+        batch.set(
+          myRef,
+          {
             'dailyKey': today,
             'dailyHearts': 0,
             'dailyMessages': 0,
-          });
-          return;
-        }
+          },
+          SetOptions(merge: true),
+        );
+        await batch.commit();
+        _lastSeenDayKey = today;
+        return;
+      }
 
-        final myScore = _asInt(me['dailyHearts']) + _asInt(me['dailyMessages']);
-        final pScore =
-            _asInt(partner['dailyHearts']) + _asInt(partner['dailyMessages']);
+      final myScore = _asInt(me['dailyHearts']) + _asInt(me['dailyMessages']);
+      final pScore =
+          _asInt(partner['dailyHearts']) + _asInt(partner['dailyMessages']);
 
-        final myIsWinner = myScore > pScore;
-        final pIsWinner = pScore > myScore;
-        final didTie = myScore == pScore;
+      final myIsWinner = myScore > pScore;
+      final pIsWinner = pScore > myScore;
+      final didTie = myScore == pScore;
 
-        final currentMyStreak = _asInt(me['winnerStreak']);
-        final currentPartnerStreak = _asInt(partner['winnerStreak']);
+      final currentMyStreak = _asInt(me['winnerStreak']);
+      final currentPartnerStreak = _asInt(partner['winnerStreak']);
 
-        final nextMyStreak =
-            didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
+      final nextMyStreak = didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
+      final nextPartnerStreak =
+          didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
 
-        final nextPartnerStreak =
-            didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
-
-        tx.update(myRef, {
+      batch.set(
+        myRef,
+        {
           'lastResultDayKey': currentKey,
           'winnerToday': myIsWinner,
           'winnerStreak': nextMyStreak,
@@ -947,9 +938,13 @@ class _HomeBodyState extends State<_HomeBody>
           'dailyKey': today,
           'dailyHearts': 0,
           'dailyMessages': 0,
-        });
+        },
+        SetOptions(merge: true),
+      );
 
-        tx.update(partnerRef, {
+      batch.set(
+        partnerRef,
+        {
           'lastResultDayKey': currentKey,
           'winnerToday': pIsWinner,
           'winnerStreak': nextPartnerStreak,
@@ -959,9 +954,11 @@ class _HomeBodyState extends State<_HomeBody>
           'dailyKey': today,
           'dailyHearts': 0,
           'dailyMessages': 0,
-        });
-      });
+        },
+        SetOptions(merge: true),
+      );
 
+      await batch.commit();
       _lastSeenDayKey = today;
     } catch (e) {
       if (!_isIgnorableCommitRace(e)) rethrow;
@@ -970,7 +967,7 @@ class _HomeBodyState extends State<_HomeBody>
 
   void _spawnHearts() {
     if (_hearts.length > 20) return;
-    final newHearts = <_FlyingHeart>[];
+    final newHearts = <HomeFlyingHeart>[];
 
     for (int i = 0; i < 10; i++) {
       final controller = AnimationController(
@@ -978,7 +975,7 @@ class _HomeBodyState extends State<_HomeBody>
         duration: Duration(milliseconds: 900 + _rand.nextInt(500)),
       );
 
-      final heart = _FlyingHeart(
+      final heart = HomeFlyingHeart(
         id: _nextHeartId++,
         x: 0.20 + _rand.nextDouble() * 0.60,
         controller: controller,
@@ -1012,11 +1009,11 @@ class _HomeBodyState extends State<_HomeBody>
           'key': mood.key,
           'emoji': mood.emoji,
           'label': mood.label,
-          'updatedAt': FieldValue.serverTimestamp(),
         },
+        'moodUpdatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
     } catch (e) {
-      if (mounted) setState(() => _error = trError(e));
+      _setErrorIfChanged(trError(e));
     }
   }
 
@@ -1098,7 +1095,7 @@ class _HomeBodyState extends State<_HomeBody>
     try {
       await _detectLiveClockTamper();
 
-      final trustedNow = await _syncTrustedNow(force: true);
+      final trustedNow = await _getFreshTrustedNow();
       if (trustedNow == null) {
         throw Exception('Sunucu saati doğrulanamadı.');
       }
@@ -1112,113 +1109,110 @@ class _HomeBodyState extends State<_HomeBody>
       final cooldownUntil = Timestamp.fromDate(
           trustedNow.add(const Duration(seconds: cooldownSeconds)));
 
-      await FirestoreService.instance.db.runTransaction((tx) async {
-        final mySnap = await tx.get(meRef);
-        final partnerSnap = await tx.get(partnerRef);
+      if (_isCoolingDown()) {
+        _showCooldownSnack();
+        return;
+      }
 
-        final myData = mySnap.data() ?? <String, dynamic>{};
-        final partnerData = partnerSnap.data() ?? <String, dynamic>{};
+      final mySnap = await meRef.get();
+      final partnerSnap = await partnerRef.get();
 
-        final penaltyTs = myData['penaltyUntil'];
-        if (penaltyTs is Timestamp && penaltyTs.toDate().isAfter(trustedNow)) {
-          throw _BlockedSendException(
-            until: penaltyTs.toDate(),
-            isPenalty: true,
-          );
+      final myData = mySnap.data() ?? <String, dynamic>{};
+      final partnerData = partnerSnap.data() ?? <String, dynamic>{};
+
+      final penaltyTs = myData['penaltyUntil'];
+      if (penaltyTs is Timestamp && penaltyTs.toDate().isAfter(trustedNow)) {
+        throw _BlockedSendException(
+          until: penaltyTs.toDate(),
+          isPenalty: true,
+        );
+      }
+
+      final currentCooldownTs = myData['cooldownUntil'];
+      if (currentCooldownTs is Timestamp &&
+          currentCooldownTs.toDate().isAfter(trustedNow)) {
+        throw _BlockedSendException(
+          until: currentCooldownTs.toDate(),
+          isPenalty: false,
+        );
+      }
+
+      final batch = FirestoreService.instance.db.batch();
+      final currentKey = _asStr(myData['dailyKey']);
+      if (currentKey != today) {
+        if (currentKey.isEmpty) {
+          batch.set(meRef, {
+            'dailyKey': today,
+            'dailyHearts': 0,
+            'dailyMessages': 0,
+          }, SetOptions(merge: true));
+        } else {
+          final myScore =
+              _asInt(myData['dailyHearts']) + _asInt(myData['dailyMessages']);
+          final pScore = _asInt(partnerData['dailyHearts']) +
+              _asInt(partnerData['dailyMessages']);
+
+          final myIsWinner = myScore > pScore;
+          final pIsWinner = pScore > myScore;
+          final didTie = myScore == pScore;
+
+          final currentMyStreak = _asInt(myData['winnerStreak']);
+          final currentPartnerStreak = _asInt(partnerData['winnerStreak']);
+
+          final nextMyStreak =
+              didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
+          final nextPartnerStreak =
+              didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
+
+          batch.set(meRef, {
+            'lastResultDayKey': currentKey,
+            'winnerToday': myIsWinner,
+            'winnerStreak': nextMyStreak,
+            'totalWins': myIsWinner
+                ? (_asInt(myData['totalWins']) + 1)
+                : _asInt(myData['totalWins']),
+            'dailyKey': today,
+            'dailyHearts': 0,
+            'dailyMessages': 0,
+          }, SetOptions(merge: true));
+
+          batch.set(partnerRef, {
+            'lastResultDayKey': currentKey,
+            'winnerToday': pIsWinner,
+            'winnerStreak': nextPartnerStreak,
+            'totalWins': pIsWinner
+                ? (_asInt(partnerData['totalWins']) + 1)
+                : _asInt(partnerData['totalWins']),
+            'dailyKey': today,
+            'dailyHearts': 0,
+            'dailyMessages': 0,
+          }, SetOptions(merge: true));
         }
+      }
 
-        final currentCooldownTs = myData['cooldownUntil'];
-        if (currentCooldownTs is Timestamp &&
-            currentCooldownTs.toDate().isAfter(trustedNow)) {
-          throw _BlockedSendException(
-            until: currentCooldownTs.toDate(),
-            isPenalty: false,
-          );
-        }
+      batch.set(meRef, {
+        'dailyKey': today,
+        if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
+        if (type == 'message') 'dailyMessages': FieldValue.increment(1),
+        if (type == 'heart') 'totalHearts': FieldValue.increment(1),
+        if (type == 'message') 'totalMessages': FieldValue.increment(1),
+        'cooldownUntil': cooldownUntil,
+        'lastTrustedInteractionAt': Timestamp.fromDate(trustedNow),
+      }, SetOptions(merge: true));
 
-        final suspicionTs = myData['clockTamperSuspicionUntil'];
-        if (suspicionTs is Timestamp &&
-            suspicionTs.toDate().isAfter(trustedNow)) {
-          throw _BlockedSendException(
-            until: suspicionTs.toDate(),
-            isPenalty: false,
-          );
-        }
-
-        final currentKey = _asStr(myData['dailyKey']);
-        if (currentKey != today) {
-          if (currentKey.isEmpty) {
-            tx.update(meRef, {
-              'dailyKey': today,
-              'dailyHearts': 0,
-              'dailyMessages': 0,
-            });
-          } else {
-            final myScore =
-                _asInt(myData['dailyHearts']) + _asInt(myData['dailyMessages']);
-            final pScore = _asInt(partnerData['dailyHearts']) +
-                _asInt(partnerData['dailyMessages']);
-
-            final myIsWinner = myScore > pScore;
-            final pIsWinner = pScore > myScore;
-            final didTie = myScore == pScore;
-
-            final currentMyStreak = _asInt(myData['winnerStreak']);
-            final currentPartnerStreak = _asInt(partnerData['winnerStreak']);
-
-            final nextMyStreak =
-                didTie ? 0 : (myIsWinner ? currentMyStreak + 1 : 0);
-            final nextPartnerStreak =
-                didTie ? 0 : (pIsWinner ? currentPartnerStreak + 1 : 0);
-
-            tx.update(meRef, {
-              'lastResultDayKey': currentKey,
-              'winnerToday': myIsWinner,
-              'winnerStreak': nextMyStreak,
-              'totalWins': myIsWinner
-                  ? (_asInt(myData['totalWins']) + 1)
-                  : _asInt(myData['totalWins']),
-              'dailyKey': today,
-              'dailyHearts': 0,
-              'dailyMessages': 0,
-            });
-
-            tx.update(partnerRef, {
-              'lastResultDayKey': currentKey,
-              'winnerToday': pIsWinner,
-              'winnerStreak': nextPartnerStreak,
-              'totalWins': pIsWinner
-                  ? (_asInt(partnerData['totalWins']) + 1)
-                  : _asInt(partnerData['totalWins']),
-              'dailyKey': today,
-              'dailyHearts': 0,
-              'dailyMessages': 0,
-            });
-          }
-        }
-
-        tx.update(meRef, {
-          'dailyKey': today,
-          if (type == 'heart') 'dailyHearts': FieldValue.increment(1),
-          if (type == 'message') 'dailyMessages': FieldValue.increment(1),
-          if (type == 'heart') 'totalHearts': FieldValue.increment(1),
-          if (type == 'message') 'totalMessages': FieldValue.increment(1),
-          'cooldownUntil': cooldownUntil,
-          'lastTrustedInteractionAt': Timestamp.fromDate(trustedNow),
-        });
-
-        tx.set(interactions.doc(), {
-          'pairId': pid,
-          'dayKey': today,
-          'createdAtMs': trustedNow.millisecondsSinceEpoch,
-          'type': type,
-          'message': message,
-          'createdAt': FieldValue.serverTimestamp(),
-          'fromUid': myUid,
-          'toUid': partnerUid,
-          'members': [myUid, partnerUid],
-        });
+      batch.set(interactions.doc(), {
+        'pairId': pid,
+        'dayKey': today,
+        'createdAtMs': trustedNow.millisecondsSinceEpoch,
+        'type': type,
+        'message': message,
+        'createdAt': FieldValue.serverTimestamp(),
+        'fromUid': myUid,
+        'toUid': partnerUid,
+        'members': [myUid, partnerUid],
       });
+
+      await batch.commit();
 
       _cooldownUntilTs = cooldownUntil;
       _cooldownNotifier.value = _cooldownLeft();
@@ -1246,7 +1240,7 @@ class _HomeBodyState extends State<_HomeBody>
       _cooldownNotifier.value = _cooldownLeft();
       _showCooldownSnack();
     } catch (e) {
-      if (mounted) setState(() => _error = trError(e));
+      _setErrorIfChanged(trError(e));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -1395,11 +1389,9 @@ class _HomeBodyState extends State<_HomeBody>
   void _applyServerTimingState(Map<String, dynamic> me) {
     final cooldown = me['cooldownUntil'];
     final penalty = me['penaltyUntil'];
-    final suspicion = me['clockTamperSuspicionUntil'];
 
     _cooldownUntilTs = cooldown is Timestamp ? cooldown : null;
     _penaltyUntilTs = penalty is Timestamp ? penalty : null;
-    _suspicionUntilTs = suspicion is Timestamp ? suspicion : null;
 
     final left = _cooldownLeft();
     if (_cooldownNotifier.value != left) {
@@ -1504,12 +1496,16 @@ class _HomeBodyState extends State<_HomeBody>
             final partnerMoodKey = _asStr(partnerMood['key']);
             final partnerMoodEmoji = _asStr(partnerMood['emoji']);
             final partnerMoodLabel = _asStr(partnerMood['label']);
-            final myMoodUpdatedAt = myMood['updatedAt'] is Timestamp
-                ? myMood['updatedAt'] as Timestamp
-                : null;
-            final partnerMoodUpdatedAt = partnerMood['updatedAt'] is Timestamp
-                ? partnerMood['updatedAt'] as Timestamp
-                : null;
+            final myMoodUpdatedAt = me['moodUpdatedAt'] is Timestamp
+                ? me['moodUpdatedAt'] as Timestamp
+                : (myMood['updatedAt'] is Timestamp
+                    ? myMood['updatedAt'] as Timestamp
+                    : null);
+            final partnerMoodUpdatedAt = partner['moodUpdatedAt'] is Timestamp
+                ? partner['moodUpdatedAt'] as Timestamp
+                : (partnerMood['updatedAt'] is Timestamp
+                    ? partnerMood['updatedAt'] as Timestamp
+                    : null);
 
             if (!_didInitialAutoRollover && !_rolloverRunning) {
               _didInitialAutoRollover = true;
@@ -1518,7 +1514,7 @@ class _HomeBodyState extends State<_HomeBody>
                 try {
                   await _ensureDailyRollOverIfNeeded(
                       myUid: myUid, partnerUid: partnerUid);
-                  if (mounted) setState(() {});
+                  _queueSafeRefresh();
                 } finally {
                   _rolloverRunning = false;
                 }
@@ -1539,7 +1535,7 @@ class _HomeBodyState extends State<_HomeBody>
                       myUid: myUid, partnerUid: partnerUid);
                   _ensurePartnerAndInteractionStreams(
                       myUid: myUid, partnerUid: partnerUid);
-                  if (mounted) setState(() {});
+                  _queueSafeRefresh();
                 } finally {
                   _rolloverRunning = false;
                 }
@@ -1597,10 +1593,9 @@ class _HomeBodyState extends State<_HomeBody>
                     title: const Text('Aşk Paneli'),
                     centerTitle: true,
                     actions: [
-                      PopupMenuButton<String>(
-                        tooltip: 'Menü',
-                        icon: const Icon(Icons.more_vert_rounded,
-                            color: AppTheme.primary),
+                      HomeActionMenuButton(
+                        notifEnabled: _notifEnabled,
+                        unpairing: _unpairing,
                         onSelected: (value) async {
                           if (value == 'gps' && !_sending && !_unpairing) {
                             final result = await _updateLocationOnce(
@@ -1639,7 +1634,7 @@ class _HomeBodyState extends State<_HomeBody>
                             );
 
                             if (mounted) {
-                              setState(() => _error = null);
+                              _setErrorIfChanged(null);
                             }
                           } else if (value == 'notif' && !_unpairing) {
                             final uid = _uid;
@@ -1690,92 +1685,6 @@ class _HomeBodyState extends State<_HomeBody>
                             }
                           }
                         },
-                        itemBuilder: (BuildContext context) {
-                          final isDark =
-                              Theme.of(context).brightness == Brightness.dark;
-
-                          return <PopupMenuEntry<String>>[
-                            const PopupMenuItem<String>(
-                              value: 'gps',
-                              child: Row(
-                                children: [
-                                  Icon(Icons.my_location_rounded,
-                                      color: AppTheme.primary),
-                                  SizedBox(width: 10),
-                                  Text('GPS Güncelle',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.bold)),
-                                ],
-                              ),
-                            ),
-                            PopupMenuItem<String>(
-                              value: 'notif',
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    _notifEnabled
-                                        ? Icons.notifications_active_rounded
-                                        : Icons.notifications_off_rounded,
-                                    color: AppTheme.primary,
-                                  ),
-                                  const SizedBox(width: 10),
-                                  const Text(
-                                    'Bildirimleri Aç',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.bold),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const PopupMenuDivider(),
-                            if (isDark)
-                              const PopupMenuItem<String>(
-                                value: 'theme_light',
-                                child: Row(
-                                  children: [
-                                    Icon(Icons.light_mode_rounded,
-                                        color: AppTheme.primary),
-                                    SizedBox(width: 10),
-                                    Text('Açık Tema',
-                                        style: TextStyle(
-                                            fontWeight: FontWeight.bold)),
-                                  ],
-                                ),
-                              )
-                            else
-                              const PopupMenuItem<String>(
-                                value: 'theme_dark',
-                                child: Row(
-                                  children: [
-                                    Icon(Icons.dark_mode_rounded,
-                                        color: AppTheme.primary),
-                                    SizedBox(width: 10),
-                                    Text('Koyu Tema',
-                                        style: TextStyle(
-                                            fontWeight: FontWeight.bold)),
-                                  ],
-                                ),
-                              ),
-                            const PopupMenuDivider(),
-                            const PopupMenuItem<String>(
-                              value: 'unpair',
-                              child: Row(
-                                children: [
-                                  Icon(Icons.link_off_rounded,
-                                      color: Colors.red),
-                                  SizedBox(width: 10),
-                                  Text(
-                                    'Eşleşmeyi Kaldır',
-                                    style: TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.red,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ];
-                        },
                       ),
                     ],
                   ),
@@ -1806,7 +1715,7 @@ class _HomeBodyState extends State<_HomeBody>
                       Row(
                         children: [
                           Expanded(
-                            child: _counterCard(
+                            child: HomeStatsCard(
                               title: 'Sen',
                               gender: myGender,
                               dailyHearts: myDailyHearts,
@@ -1818,7 +1727,7 @@ class _HomeBodyState extends State<_HomeBody>
                           ),
                           const SizedBox(width: 10),
                           Expanded(
-                            child: _counterCard(
+                            child: HomeStatsCard(
                               title: 'Partner',
                               gender: partnerGender,
                               dailyHearts: pDailyHearts,
@@ -1840,6 +1749,7 @@ class _HomeBodyState extends State<_HomeBody>
                             myMoodLabel.isEmpty ? null : myMoodLabel,
                         updatedAt: myMoodUpdatedAt,
                         editable: true,
+                        nowListenable: _trustedNowNotifier,
                         onMoodTap: (mood) => _setMood(mood: mood),
                       ),
                       const SizedBox(height: 10),
@@ -1853,40 +1763,18 @@ class _HomeBodyState extends State<_HomeBody>
                             partnerMoodLabel.isEmpty ? null : partnerMoodLabel,
                         updatedAt: partnerMoodUpdatedAt,
                         editable: false,
+                        nowListenable: _trustedNowNotifier,
                       ),
                       const SizedBox(height: 18),
-                      Center(
-                        child: GestureDetector(
-                          onTap: (_sending || _unpairing || _heartTapLocked)
-                              ? null
-                              : () => _sendHeart(
-                                    me: me,
-                                    partner: partner,
-                                    partnerUid: partnerUid,
-                                  ),
-                          child: Container(
-                            width: 200,
-                            height: 200,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: AppTheme.primary,
-                              boxShadow: [
-                                BoxShadow(
-                                  blurRadius: 30,
-                                  offset: const Offset(0, 18),
-                                  color: AppTheme.primary.withAlpha(70),
+                      HomeHeartButton(
+                        busy: _sending || _unpairing,
+                        onTap: (_sending || _unpairing || _heartTapLocked)
+                            ? null
+                            : () => _sendHeart(
+                                  me: me,
+                                  partner: partner,
+                                  partnerUid: partnerUid,
                                 ),
-                              ],
-                            ),
-                            child: Center(
-                              child: (_sending || _unpairing)
-                                  ? const CircularProgressIndicator(
-                                      color: Colors.white)
-                                  : const Icon(Icons.favorite_rounded,
-                                      color: Colors.white, size: 96),
-                            ),
-                          ),
-                        ),
                       ),
                       const SizedBox(height: 10),
                       ValueListenableBuilder<int>(
@@ -1957,43 +1845,22 @@ class _HomeBodyState extends State<_HomeBody>
                         ),
                       ],
                       const SizedBox(height: 16),
-                      Card(
-                        child: Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: _manual,
-                                  enabled: !_sending && !_unpairing,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Mesaj yaz',
-                                    hintText: 'Kısa bir şey yaz…',
-                                  ),
+                      HomeComposeCard(
+                        controller: _manual,
+                        enabled: !_sending && !_unpairing,
+                        onSend: (_sending || _unpairing || _messageTapLocked)
+                            ? null
+                            : () => _sendManual(
+                                  me: me,
+                                  partner: partner,
+                                  partnerUid: partnerUid,
                                 ),
-                              ),
-                              const SizedBox(width: 10),
-                              ElevatedButton(
-                                onPressed: (_sending ||
-                                        _unpairing ||
-                                        _messageTapLocked)
-                                    ? null
-                                    : () => _sendManual(
-                                          me: me,
-                                          partner: partner,
-                                          partnerUid: partnerUid,
-                                        ),
-                                child: const Text('Gönder'),
-                              ),
-                            ],
-                          ),
-                        ),
                       ),
                       const SizedBox(height: 20),
                     ],
                   ),
                 ),
-                ..._hearts.map((h) => _FlyingHeartWidget(heart: h)),
+                FlyingHeartsOverlay(hearts: _hearts),
               ],
             );
           },
@@ -2002,123 +1869,4 @@ class _HomeBodyState extends State<_HomeBody>
     );
   }
 
-  Widget _counterCard({
-    required String title,
-    required String gender,
-    required int dailyHearts,
-    required int dailyMsgs,
-    required int totalHearts,
-    required int totalMsgs,
-    required bool winner,
-  }) {
-    final badge = winner ? ' 🏆' : '';
-    final isFem = gender == 'kadin';
-    final themeColor = isFem ? Colors.pink : Colors.blue;
-    final icon = isFem ? Icons.woman_rounded : Icons.man_rounded;
-
-    return Card(
-      child: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              themeColor.withAlpha(20),
-              Theme.of(context).cardColor,
-            ],
-          ),
-        ),
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(icon, size: 22, color: themeColor),
-                const SizedBox(width: 6),
-                Text(
-                  '$title$badge',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w900,
-                    color: themeColor,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text('💗 Kalp: $dailyHearts',
-                style:
-                    const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
-            Text(' (Toplam: $totalHearts)',
-                style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 12,
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurface
-                        .withAlpha(160))),
-            const SizedBox(height: 6),
-            Text('💬 Mesaj: $dailyMsgs',
-                style:
-                    const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
-            Text(' (Toplam: $totalMsgs)',
-                style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 12,
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurface
-                        .withAlpha(160))),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _FlyingHeart {
-  final int id;
-  final double x;
-  final AnimationController controller;
-
-  _FlyingHeart({
-    required this.id,
-    required this.x,
-    required this.controller,
-  });
-}
-
-class _FlyingHeartWidget extends StatelessWidget {
-  final _FlyingHeart heart;
-
-  const _FlyingHeartWidget({required this.heart});
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: heart.controller,
-      builder: (context, _) {
-        final t = heart.controller.value;
-        final top = MediaQuery.of(context).size.height * (0.68 - 0.40 * t);
-        final left = MediaQuery.of(context).size.width * heart.x;
-
-        return Positioned(
-          top: top,
-          left: left,
-          child: Opacity(
-            opacity: (1 - t).clamp(0, 1),
-            child: Transform.scale(
-              scale: 0.8 + 0.5 * (1 - t),
-              child: Icon(
-                Icons.favorite,
-                color: AppTheme.primary.withAlpha(240),
-                size: 26,
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
 }

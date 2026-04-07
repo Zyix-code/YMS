@@ -5,8 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 
 import '../services/notification_service.dart';
-import '../services/trusted_time_service.dart';
 import '../theme/app_theme.dart';
+import '../services/trusted_time_service.dart';
 
 import 'package:flutter/foundation.dart';
 
@@ -27,9 +27,7 @@ class _JourneyScreenState extends State<JourneyScreen> {
 
   late final ValueNotifier<DateTime> _nowNotifier;
   Timer? _ticker;
-
-  DateTime _trustedNow() =>
-      TrustedTimeService.instance.now() ?? _nowNotifier.value;
+  int _resyncTick = 0;
 
   String _getPairId(String myUid, String partnerUid) {
     final ids = [myUid, partnerUid]..sort();
@@ -52,7 +50,7 @@ class _JourneyScreenState extends State<JourneyScreen> {
 
     try {
       final sp = await SharedPreferences.getInstance();
-      final now = await TrustedTimeService.instance.nowOrSync();
+      final now = DateTime.now();
 
       for (final item in milestones) {
         final title = (item['title'] ?? '').toString().trim();
@@ -105,16 +103,9 @@ class _JourneyScreenState extends State<JourneyScreen> {
   @override
   void initState() {
     super.initState();
-    TrustedTimeService.instance.startSession();
-    _nowNotifier = ValueNotifier<DateTime>(DateTime.fromMillisecondsSinceEpoch(0, isUtc: true));
-    Future<void>(() async {
-      final synced = await TrustedTimeService.instance.nowOrSync(force: true);
-      if (mounted) {
-        _nowNotifier.value = synced;
-      }
-    });
-    _ticker = Timer.periodic(const Duration(seconds: 1), (_) async {
-      _nowNotifier.value = await TrustedTimeService.instance.nowOrSync();
+    _nowNotifier = ValueNotifier<DateTime>(DateTime.now());
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      _nowNotifier.value = DateTime.now();
     });
   }
 
@@ -139,17 +130,6 @@ class _JourneyScreenState extends State<JourneyScreen> {
       stream:
           FirebaseFirestore.instance.collection('users').doc(_uid).snapshots(),
       builder: (context, userSnap) {
-        if (userSnap.hasError) {
-          return Scaffold(
-            body: Center(
-              child: Text(
-                'Kullanıcı verisi okunamadı:\n${userSnap.error}',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          );
-        }
-
         if (!userSnap.hasData) {
           return const Scaffold(
             body: Center(child: CircularProgressIndicator()),
@@ -212,15 +192,6 @@ class _JourneyScreenState extends State<JourneyScreen> {
                 .doc(pairId)
                 .snapshots(),
             builder: (context, pairSnap) {
-              if (pairSnap.hasError) {
-                return Center(
-                  child: Text(
-                    'Yolculuk verisi okunamadı:\n${pairSnap.error}',
-                    textAlign: TextAlign.center,
-                  ),
-                );
-              }
-
               if (!pairSnap.hasData) {
                 return const Center(child: CircularProgressIndicator());
               }
@@ -291,7 +262,7 @@ class _JourneyScreenState extends State<JourneyScreen> {
   }) {
     final titleController = TextEditingController();
     final noteController = TextEditingController();
-    DateTime selectedDate = _nowNotifier.value;
+    DateTime selectedDate = DateTime.now();
     bool isSaving = false;
     String? formError;
 
@@ -421,14 +392,16 @@ class _JourneyScreenState extends State<JourneyScreen> {
                                           data['milestones'] ?? const []);
 
                                   currentMilestones.add({
-                                    'id': FirebaseFirestore.instance.collection('pairs').doc().id,
+                                    'id': DateTime.now()
+                                        .microsecondsSinceEpoch
+                                        .toString(),
                                     'title': title,
                                     'date': Timestamp.fromDate(selectedDate),
-                                    'createdAt': Timestamp.fromDate(await TrustedTimeService.instance.nowOrSync(force: true)),
+                                    'createdAt': Timestamp.now(),
                                     'createdBy': _uid,
                                     'lastEditedBy': editorName,
                                     'lastEditedByUid': _uid,
-                                    'lastEditedAt': Timestamp.fromDate(await TrustedTimeService.instance.nowOrSync(force: true)),
+                                    'lastEditedAt': Timestamp.now(),
                                     'lastEditNote': note,
                                   });
 
@@ -651,8 +624,7 @@ class _MilestoneCard extends StatelessWidget {
                             ..['lastEditedBy'] = currentUserName
                             ..['lastEditedByUid'] = currentUid
                             ..['lastEditedAt'] = Timestamp.fromDate(
-                              await TrustedTimeService.instance.nowOrSync(force: true),
-                            )
+                                await TrustedTimeService.instance.nowOrSync())
                             ..['lastEditNote'] = noteController.text.trim();
 
                           await _replaceMilestone(

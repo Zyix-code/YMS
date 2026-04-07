@@ -221,7 +221,7 @@ class LoveMessages {
 
   static Future<String> randomFor(String name) async {
     final prefs = await SharedPreferences.getInstance();
-    final now = await TrustedTimeService.instance.nowOrSync();
+    final now = TrustedTimeService.instance.now() ?? await TrustedTimeService.instance.nowOrSync();
     final today = TrustedTimeService.instance.dayKeyTR(now);
 
     final lastDate = prefs.getString(_dateKey);

@@ -1,8 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../theme/app_theme.dart';
-import '../../services/trusted_time_service.dart';
 
 class MoodOption {
   final String key;
@@ -35,6 +35,7 @@ class MoodCard extends StatelessWidget {
   final String? selectedMoodLabel;
   final Timestamp? updatedAt;
   final bool editable;
+  final ValueListenable<DateTime>? nowListenable;
   final ValueChanged<MoodOption>? onMoodTap;
 
   const MoodCard({
@@ -45,17 +46,15 @@ class MoodCard extends StatelessWidget {
     required this.selectedMoodLabel,
     required this.updatedAt,
     required this.editable,
+    this.nowListenable,
     this.onMoodTap,
   });
 
-  String _timeAgo(Timestamp? ts) {
+  String _timeAgo(Timestamp? ts, DateTime now) {
     if (ts == null) return '';
 
-    final now = TrustedTimeService.instance.now();
-    if (now == null) return '';
     final dt = ts.toDate();
     final diff = now.difference(dt);
-    if (diff.isNegative) return 'şimdi';
 
     if (diff.inSeconds < 60) return '${diff.inSeconds} sn önce';
     if (diff.inMinutes < 60) return '${diff.inMinutes} dk önce';
@@ -87,34 +86,51 @@ class MoodCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
-            StreamBuilder<int>(
-              stream: Stream<int>.periodic(
-                const Duration(seconds: 1),
-                (x) => x,
-              ),
-              builder: (context, _) {
-                final agoText = _timeAgo(updatedAt);
-
-                return Row(
-                  children: [
-                    Text(
-                      selectedMoodEmoji ?? '🙂',
-                      style: const TextStyle(fontSize: 24),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        agoText.isEmpty ? moodText : '$moodText • $agoText',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          color: cs.onSurface.withAlpha(220),
-                        ),
+            if (nowListenable == null)
+              Row(
+                children: [
+                  Text(
+                    selectedMoodEmoji ?? '🙂',
+                    style: const TextStyle(fontSize: 24),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      moodText,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: cs.onSurface.withAlpha(220),
                       ),
                     ),
-                  ],
-                );
-              },
-            ),
+                  ),
+                ],
+              )
+            else
+              ValueListenableBuilder<DateTime>(
+                valueListenable: nowListenable!,
+                builder: (context, now, _) {
+                  final agoText = _timeAgo(updatedAt, now);
+
+                  return Row(
+                    children: [
+                      Text(
+                        selectedMoodEmoji ?? '🙂',
+                        style: const TextStyle(fontSize: 24),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          agoText.isEmpty ? moodText : '$moodText • $agoText',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: cs.onSurface.withAlpha(220),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
             const SizedBox(height: 12),
             Wrap(
               spacing: 10,

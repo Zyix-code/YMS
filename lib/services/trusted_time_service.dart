@@ -28,12 +28,15 @@ class TrustedTimeService {
   static const String _kLastDeviceNowMs = 'yms_last_device_now_ms';
   static const String _kLastTimezoneOffsetMinutes =
       'yms_last_timezone_offset_minutes';
+  static const String _kCachedServerNowMs = 'yms_cached_server_now_ms';
+  static const String _kCachedDeviceNowMs = 'yms_cached_device_now_ms';
 
   DateTime? _baseServerNow;
   final Stopwatch _serverStopwatch = Stopwatch();
   final Stopwatch _deviceStopwatch = Stopwatch();
 
   Future<DateTime?>? _syncing;
+  Future<void>? _bootstrapping;
   int _lastWallClockMs = 0;
   int _lastMonotonicMs = 0;
   int _lastTamperHandledMonoMs = -600000;
@@ -49,29 +52,62 @@ class TrustedTimeService {
     _lastTimezoneOffsetMinutes = DateTime.now().timeZoneOffset.inMinutes;
   }
 
+  Future<void> bootstrap() {
+    startSession();
+    if (_baseServerNow != null) return Future.value();
+    final running = _bootstrapping;
+    if (running != null) return running;
+    final future = _bootstrapImpl().whenComplete(() => _bootstrapping = null);
+    _bootstrapping = future;
+    return future;
+  }
+
+  Future<void> _bootstrapImpl() async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      final cachedServerNowMs = sp.getInt(_kCachedServerNowMs);
+      final cachedDeviceNowMs = sp.getInt(_kCachedDeviceNowMs);
+      if (cachedServerNowMs == null || cachedDeviceNowMs == null) return;
+
+      var deltaMs = DateTime.now().millisecondsSinceEpoch - cachedDeviceNowMs;
+      if (deltaMs < 0) deltaMs = 0;
+      const maxBootstrapDeltaMs = 1000 * 60 * 60 * 24;
+      if (deltaMs > maxBootstrapDeltaMs) deltaMs = maxBootstrapDeltaMs;
+
+      _baseServerNow = DateTime.fromMillisecondsSinceEpoch(
+        cachedServerNowMs,
+        isUtc: true,
+      ).add(Duration(milliseconds: deltaMs));
+      _serverStopwatch
+        ..reset()
+        ..start();
+    } catch (_) {}
+  }
+
   DateTime? now() {
     final base = _baseServerNow;
     if (base == null) return null;
     return base.add(_serverStopwatch.elapsed);
   }
 
-  Future<DateTime?> sync({bool force = false}) {
+  Future<DateTime?> sync({bool force = false}) async {
     startSession();
+    await bootstrap();
 
     final cached = now();
-    if (!force &&
-        cached != null &&
-        _serverStopwatch.isRunning &&
-        _serverStopwatch.elapsed < const Duration(seconds: 20)) {
-      return Future.value(cached);
+    final shouldRefresh = force ||
+        cached == null ||
+        !_serverStopwatch.isRunning ||
+        _serverStopwatch.elapsed >= const Duration(seconds: 45);
+
+    if (cached != null) {
+      if (shouldRefresh) {
+        _ensureBackgroundSync();
+      }
+      return cached;
     }
 
-    final running = _syncing;
-    if (running != null) return running;
-
-    final future = _syncImpl().whenComplete(() => _syncing = null);
-    _syncing = future;
-    return future;
+    return _ensureForegroundSync();
   }
 
   Future<DateTime> nowOrSync({bool force = false}) async {
@@ -79,6 +115,19 @@ class TrustedTimeService {
     if (cached != null && !force) return cached;
     final synced = await sync(force: force);
     return synced ?? DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+  }
+
+  void _ensureBackgroundSync() {
+    if (_syncing != null) return;
+    _syncing = _syncImpl().whenComplete(() => _syncing = null);
+  }
+
+  Future<DateTime?> _ensureForegroundSync() {
+    final running = _syncing;
+    if (running != null) return running;
+    final future = _syncImpl().whenComplete(() => _syncing = null);
+    _syncing = future;
+    return future;
   }
 
   Future<DateTime?> _syncImpl() async {
@@ -93,11 +142,22 @@ class TrustedTimeService {
       );
       final snap = await ref.get(const GetOptions(source: Source.server));
       final ts = snap.data()?['clockSyncAt'];
+
       if (ts is Timestamp) {
-        _baseServerNow = ts.toDate();
+        _baseServerNow = ts.toDate().toUtc();
         _serverStopwatch
           ..reset()
           ..start();
+
+        final sp = await SharedPreferences.getInstance();
+        await sp.setInt(
+          _kCachedServerNowMs,
+          _baseServerNow!.millisecondsSinceEpoch,
+        );
+        await sp.setInt(
+          _kCachedDeviceNowMs,
+          DateTime.now().millisecondsSinceEpoch,
+        );
       }
     } catch (_) {}
 
@@ -129,41 +189,13 @@ class TrustedTimeService {
 
     try {
       final sp = await SharedPreferences.getInstance();
-      final lastTrustedMs = sp.getInt(_kLastTrustedNowMs);
-      final lastDeviceMs = sp.getInt(_kLastDeviceNowMs);
-      final lastOffsetMinutes =
-          sp.getInt(_kLastTimezoneOffsetMinutes) ?? currentOffsetMinutes;
-
-      TrustedTamperSignal? detected;
-      if (lastTrustedMs != null &&
-          lastTrustedMs > 0 &&
-          lastDeviceMs != null &&
-          lastDeviceMs > 0) {
-        final trustedDelta = nowTrustedMs - lastTrustedMs;
-        final deviceDelta = nowDeviceMs - lastDeviceMs;
-        final drift = (deviceDelta - trustedDelta).abs();
-        final timezoneChanged = lastOffsetMinutes != currentOffsetMinutes;
-
-        if (!timezoneChanged &&
-            trustedDelta > 0 &&
-            drift > tolerance.inMilliseconds) {
-          detected = TrustedTamperSignal(
-            reason: 'persisted_clock_jump',
-            deviceDeltaMs: deviceDelta,
-            trustedDeltaMs: trustedDelta,
-            isStrong: false,
-          );
-        }
-      }
-
       await sp.setInt(_kLastTrustedNowMs, nowTrustedMs);
       await sp.setInt(_kLastDeviceNowMs, nowDeviceMs);
       await sp.setInt(_kLastTimezoneOffsetMinutes, currentOffsetMinutes);
       _lastTimezoneOffsetMinutes = currentOffsetMinutes;
-      return detected;
-    } catch (_) {
-      return null;
-    }
+    } catch (_) {}
+
+    return null;
   }
 
   TrustedTamperSignal? detectLiveClockTamper({
