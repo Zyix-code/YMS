@@ -27,7 +27,6 @@ class _JourneyScreenState extends State<JourneyScreen> {
 
   late final ValueNotifier<DateTime> _nowNotifier;
   Timer? _ticker;
-  int _resyncTick = 0;
 
   String _getPairId(String myUid, String partnerUid) {
     final ids = [myUid, partnerUid]..sort();
@@ -154,7 +153,7 @@ class _JourneyScreenState extends State<JourneyScreen> {
         }
 
         final myDisplayName = _displayNameFromUser(userData);
-        final pairId = _getPairId(_uid!, partnerUid);
+        final pairId = _getPairId(_uid, partnerUid);
 
         return Scaffold(
           backgroundColor: Theme.of(context).scaffoldBackgroundColor,
@@ -242,7 +241,7 @@ class _JourneyScreenState extends State<JourneyScreen> {
                   return _MilestoneCard(
                     milestone: rawMilestones[index],
                     pairId: pairId,
-                    currentUid: _uid!,
+                    currentUid: _uid,
                     currentUserName: myDisplayName,
                     nowListenable: _nowNotifier,
                   );
@@ -773,7 +772,7 @@ class _MilestoneCard extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    '$lastEditedBy, ${_formatDateTime(lastEditedAt!)} tarihinde bu gün ile alakalı değişiklik yaptı.',
+                    '$lastEditedBy, ${_formatDateTime(lastEditedAt)} tarihinde bu gün ile alakalı değişiklik yaptı.',
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w800,
