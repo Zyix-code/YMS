@@ -190,9 +190,7 @@ winnerStreak
 
 ## ⚖️ Lisans
 
-Bu proje kişisel kullanım için geliştirilmiştir.
-
-Açık kaynak olarak paylaşılmıştır ancak ticari kullanım için uygun değildir.
+Bu proje GNU General Public License v3.0 ile lisanslanmıştır. zyixcode tarafından geliştirilen bu projeyi, lisans koşullarına uyarak özgürce kullanabilirsiniz.
 
 ---
 
